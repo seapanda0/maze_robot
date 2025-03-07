@@ -6,8 +6,14 @@
 
 /*I2C Configuration Define Start*/
 
+#define TCS34725_SAMPLE_SIZE 10
+
+#define COLOR_SENSOR_CENTER 0
+#define COLOR_SENSOR_LEFT 2
+#define COLOR_SENSOR_RIGHT 1
 
 #define TCS34725_LOG_TAG "TCS34725"
+#define FIRING_THRESHOLD 0.015
 
 /*I2C Configuration Define End*/
 
@@ -18,6 +24,9 @@
 #define TCA95_CH3 0x08 // TCA9548A Channel 3
 /* TCA95 I2C Mux Constants End */
 
+void normalizeRGB(float r, float g, float b, float c, float* norm);
+float colorDistance(float r1, float g1, float b1, float r2, float g2, float b2);
+void print_normalized(float arr[7][3]);
 
 /* Public Functions */
 esp_err_t tcs34725_init(i2c_master_dev_handle_t *tcs34725_handle);

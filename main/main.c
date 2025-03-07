@@ -8,9 +8,12 @@
 #include "driver/mcpwm_prelude.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 
+#include <math.h>
 #include <stdlib.h> // For abs()
 
+#include "nvs.h"
 #include "tcs34725.h"
 #include "vlx53l0x.h"
 #include "i2c_configuration.h"
@@ -41,6 +44,9 @@ mcpwm_cmpr_handle_t servo = NULL;
 TaskHandle_t sensor_sampling_handler = NULL, move_straight_task_handler = NULL;
 TaskHandle_t wall_detection_task_handler = NULL;
 TaskHandle_t calibrate_color_sensor_task_handler = NULL;
+TaskHandle_t uart_control_task_handler = NULL;
+TaskHandle_t color_sensor_compute_task_handler = NULL;
+TaskHandle_t maze_logic_task_handler = NULL;
 
 /* Task command status */
 taskCommand_t motor_speed_task_command = STOP; 
@@ -60,6 +66,7 @@ uint32_t cycle_count = 0;
 /*Sensor Readings*/
 float angleZ = 0;
 uint32_t r[3] = {0}, g[3] = {0}, b[3] = {0}, c[3] = {0};
+float normalized_data[3][3];
 vl53_distancce_t vl53[5] = {0};
 int encoder_1_count = 0, encoder_2_count = 0;
 float global_x = 0; 
@@ -79,6 +86,7 @@ bool wall_calibration_in_position = false;
 /*Motor controls*/
 float basespeed_m0 = 1.25;
 float basespeed_m1 = 1.25;
+int servo_pos = 0;
 
 /*Manual Overrides Via UART*/
 char keyboard_input = 0;
@@ -93,7 +101,21 @@ uart_control_input_t uart_task_args = {
 
 /*Color calibration state*/
 bool calibrate_color = false;
-float temp_normalized[3];
+float normalized_calibration[7][3];
+float eucd_distances_left[3];
+float eucd_distances_right[3];
+float eucd_distances_bottom[4];
+bool left_color_detected = false;
+bool right_color_detected = false;
+bool bottom_color_detected = false;
+
+/*Maze Logic FreeRTOS Command codes*/
+maze_event_t maze_event = WALL_EVENT;
+bool reset_kinematiccs = false;
+bool fire_wall_event = false;
+bool fire_side_wall_event = false;
+
+void servo_blink_extrude(void *args);
 
 bool sensors_sampling_isr_handler (gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx){
     BaseType_t xTaskawaken = pdFALSE;
@@ -131,6 +153,12 @@ void sensors_sampling_task (void *arg){
                 mpu6050_move_straight_pid();
                 pid_motors[0].target_value = basespeed_m0 + mpu6050_pid_params.output;
                 pid_motors[1].target_value = basespeed_m0 - mpu6050_pid_params.output;
+                break;
+            }
+            case REVERSE:{
+                mpu6050_move_straight_pid();
+                pid_motors[0].target_value = -basespeed_m0 + mpu6050_pid_params.output;
+                pid_motors[1].target_value = -basespeed_m0 - mpu6050_pid_params.output;
                 break;
             }
             case TURN:{
@@ -174,51 +202,236 @@ void sensors_sampling_task (void *arg){
                 if (status == ESP_OK) {        
                     vl53[i].distance = read_buf[1] | (read_buf[0] << 8);
                 } // Implement error handling!!!
-                
-                // we wont see vl53 over 800 in our application anyway
-                if (vl53[i].distance > 800){
-                    vl53[i].detection = NOT_VALID;
-                }else if (vl53[i].distance > 120){
-                    vl53[i].detection = EMPTY;
-                }else{
-                    vl53[i].detection = WALL;
+            }
+            // we wont see vl53 over 800 in our application anyway
+            if (vl53[VL53_FRONT_CENTER].distance > 800){
+                vl53[VL53_FRONT_CENTER].detection = NOT_VALID;
+            }
+            else if (vl53[VL53_FRONT_CENTER].distance > 120)
+            {
+                vl53[VL53_FRONT_CENTER].detection = EMPTY;
+            }
+            else{
+                vl53[VL53_FRONT_CENTER].detection = WALL;
+            }
+
+            if (vl53[VL53_LEFT].distance > 800){ 
+                vl53[VL53_LEFT].detection = NOT_VALID;
+            }
+            else if (vl53[VL53_LEFT].distance > 200)
+            {
+                vl53[VL53_LEFT].detection = EMPTY;
+                if (fire_side_wall_event){
+                    xTaskNotifyGiveIndexed(maze_logic_task_handler, SIDE_WALL_SLOT);
+                }
+
+            }
+            else{
+                vl53[VL53_LEFT].detection = WALL;
+            }
+
+            if (vl53[VL53z_RIGHT].distance > 800){
+                vl53[VL53z_RIGHT].detection = NOT_VALID;
+            }
+            else if (vl53[VL53z_RIGHT].distance > 200)
+            {
+                vl53[VL53z_RIGHT].detection = EMPTY;
+                if (fire_side_wall_event){
+                    xTaskNotifyGiveIndexed(maze_logic_task_handler, SIDE_WALL_SLOT);
                 }
             }
-            xTaskNotifyGive(wall_detection_task_handler);
+            else{
+                vl53[VL53z_RIGHT].detection = WALL;
+            }
+
+            if (fire_wall_event){
+                xTaskNotifyGive(maze_logic_task_handler);
+            }
+            // xTaskNotifyGive(wall_detection_task_handler);
             
         }
         
         // Every 60th cycle, 240ms, sample tcs34725
         if (cycle_count % 60 == 0){
             tcs34725_read_raw_multi(&tcs34725_handle, &tca95_handle, c, r, g, b);  // Implement error handling!!!
+            for (int  i = 0; i < 3; i++){
+                normalizeRGB((float)r[i], (float)g[i], (float)b[i], (float)c[i], normalized_data[i]);
+            }
+            xTaskNotifyGive(color_sensor_compute_task_handler);
+
+            if (calibrate_color){
+                xTaskNotifyGive(calibrate_color_sensor_task_handler);
+            }
+
         }
         // prev_time = curr_time;
         // curr_time = esp_timer_get_time();
         // delta_time = curr_time - prev_time;
         // if (delta_time > 3000){
-        //     ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
+            // ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
         // }
     }
 }
 
+void color_sensor_compute_task (void * arg){
+    while(1){
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // wait until new sensor data is avaliable
+        // prev_time = esp_timer_get_time();
+
+        // compute left sensor
+        for(int i = 0; i < 3; i++){
+            eucd_distances_left[i] = colorDistance(normalized_data[COLOR_SENSOR_LEFT][0], normalized_data[COLOR_SENSOR_LEFT][1], normalized_data[COLOR_SENSOR_LEFT][2], 
+                normalized_calibration[i][0], normalized_calibration[i][1], normalized_calibration[i][2]);
+            }
+            // ESP_LOGI(TCS34725_LOG_TAG, " Left Sensor: Green %f Blue %f Black %f",  eucd_distances_left[0], eucd_distances_left[1], eucd_distances_left[2]);
+            
+        // compute right sensor
+        for(int i = 0; i < 3; i++){
+            eucd_distances_right[i] = colorDistance(normalized_data[COLOR_SENSOR_RIGHT][0], normalized_data[COLOR_SENSOR_RIGHT][1], normalized_data[COLOR_SENSOR_RIGHT][2], 
+                normalized_calibration[i][0], normalized_calibration[i][1], normalized_calibration[i][2]);
+            }
+            // ESP_LOGI(TCS34725_LOG_TAG, " Right Sensor: Green %f Blue %f Black %f",  eucd_distances_right[0], eucd_distances_right[1], eucd_distances_right[2]);
+
+        // compute bottom sensor
+        for(int i = 0; i < 4; i++){
+            eucd_distances_bottom[i] = colorDistance(normalized_data[COLOR_SENSOR_CENTER][0], normalized_data[COLOR_SENSOR_CENTER][1], normalized_data[COLOR_SENSOR_CENTER][2], 
+                normalized_calibration[3 +i][0], normalized_calibration[3+i][1], normalized_calibration[3+i][2]);
+            }
+            // ESP_LOGI(TCS34725_LOG_TAG, " Bottom Sensor: Black %f Red %f Blue %f Yellow %f",  eucd_distances_bottom[0], eucd_distances_bottom[1], eucd_distances_bottom[2], eucd_distances_bottom[4]);
+        
+        left_color_detected = false;
+        right_color_detected = false;
+        bottom_color_detected = false;
+        for(int i = 0; i < 3; i++){
+            if (eucd_distances_left[i] < FIRING_THRESHOLD){
+                left_color_detected = true;
+                ESP_LOGI(TCS34725_LOG_TAG, "Left detected color %d", i);
+                xTaskCreatePinnedToCore(servo_blink_extrude, "servo", 2048, NULL, 15, NULL, 1);
+
+            }
+            if (eucd_distances_right[i] < FIRING_THRESHOLD){
+                right_color_detected = true;
+                ESP_LOGI(TCS34725_LOG_TAG, "Right detected color %d", i);
+                xTaskCreatePinnedToCore(servo_blink_extrude, "servo", 2048, NULL, 15, NULL, 1);
+
+            }
+
+        }
+        for(int i = 0; i < 4; i++){
+            if (eucd_distances_bottom[i] < FIRING_THRESHOLD){
+                bottom_color_detected = true;
+                ESP_LOGI(TCS34725_LOG_TAG, "Bottom detected color %d", i);
+
+            }
+        }
+        // curr_time = esp_timer_get_time();
+
+        
+        // ESP_LOGI(TCS34725_LOG_TAG, "Distance %lld", curr_time-prev_time);
+    }
+
+}
+
 void kinematics(){
     // Every 4ms calculate speed once to for kinematic
+    if (reset_kinematiccs == true){
+        global_x = 0;
+    }
+
+    pcnt_unit_get_count(encoder1, &encoder_pulses[0].curr_count_kine);
+    pcnt_unit_get_count(encoder2, &encoder_pulses[1].curr_count_kine);
     for (int i = 0; i < 2; i++){
-        pcnt_unit_get_count(encoder1, &encoder_pulses[i].curr_count_kine);
-        encoder_pulses[i].delta_count = (encoder_pulses[i].curr_count_kine - encoder_pulses[i].prev_count_kine);
+        encoder_pulses[i].delta_count_kine = (encoder_pulses[i].curr_count_kine - encoder_pulses[i].prev_count_kine);
         encoder_pulses[i].prev_count_kine = encoder_pulses[i].curr_count_kine;
     }
-    // Current units are now in cm per second
-    v_left = (encoder_pulses[0].delta_count / (KINEMATICS_SAMPLING_PERIOD *  PULSE_PER_ROTATION)) * (2 * PI * WHEEL_RADIUS);
-    v_right = (encoder_pulses[1].delta_count / (KINEMATICS_SAMPLING_PERIOD *  PULSE_PER_ROTATION)) * (2 * PI * WHEEL_RADIUS);
+    // Current units are now in cm per mili second
+    v_left = ((float)encoder_pulses[0].delta_count_kine / ( PULSE_PER_ROTATION)) * (2 * PI * WHEEL_RADIUS);
+    v_right = ((float)encoder_pulses[1].delta_count_kine / ( PULSE_PER_ROTATION)) * (2 * PI * WHEEL_RADIUS);
     
-    delta_x = (v_left / 2);
+    // Units are in cm
+    delta_x = ((v_left + v_right)/2);
+    global_x += delta_x;
+    
+    // prev_time = curr_time;
+    // curr_time = esp_timer_get_time();
+    // delta_time = curr_time - prev_time;
+
 }
 
 void color_calibration_task(void *arg){
-    while(1){
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    float temp_r;
+    float temp_g;
+    float temp_b;
+    float temp_c;
+
+    ESP_LOGI(TCS34725_LOG_TAG, "Starting calibrations, start with Green on Left Sensor");
+    // For side sensor
+    for (int i = 0; i < 3; i ++){
+        temp_r = 0;
+        temp_g = 0;
+        temp_b = 0;
+        temp_c = 0;
+
+        ESP_LOGI(TCS34725_LOG_TAG, "Ready to calibrate color code K%d on LEFT SENSOR. Press any key to start....", i);
+        wait_for_character();
+        ESP_LOGI(TCS34725_LOG_TAG, "Calibrating, DO NOT MOVE THE ROBOT");
+        for (int j = 0; j <= TCS34725_SAMPLE_SIZE; j++){
+            // the sensor sampling task will fire notification based on this variable
+            calibrate_color = true;
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // wait until new sensor data is avaliable
+            temp_r += r[COLOR_SENSOR_LEFT];
+            temp_g += g[COLOR_SENSOR_LEFT];
+            temp_b += b[COLOR_SENSOR_LEFT];
+            temp_c += c[COLOR_SENSOR_LEFT];
+        }
+        calibrate_color = false;
+        temp_r = temp_r / TCS34725_SAMPLE_SIZE;
+        temp_g = temp_g / TCS34725_SAMPLE_SIZE;
+        temp_b = temp_b / TCS34725_SAMPLE_SIZE;
+        temp_c = temp_c / TCS34725_SAMPLE_SIZE;
+        normalizeRGB(temp_r, temp_g, temp_b, temp_c, normalized_calibration[i]);
+        ESP_LOGI(TCS34725_LOG_TAG, "Avg_R:%f, Avg_G:%f, Avg_B:%f, Avg_C:%f, NR:%f, NG:%f, NB:%f", temp_r, temp_g, temp_b, temp_c, normalized_calibration[i][0], normalized_calibration[i][1], normalized_calibration[i][2]);
+        ESP_LOGI(TCS34725_LOG_TAG, "Calibration for color K%d Complete! \n", i);
     }
+    ESP_LOGI(TCS34725_LOG_TAG, "SWITCHING TO BOTTOM SENSOR");
+    for (int i = 3; i < 7; i ++){
+        temp_r = 0;
+        temp_g = 0;
+        temp_b = 0;
+        temp_c = 0;
+
+        ESP_LOGI(TCS34725_LOG_TAG, "Ready to calibrate color code K%d on BOTTOM SENSOR. Press any key to start....", i);
+        wait_for_character();
+        ESP_LOGI(TCS34725_LOG_TAG, "Calibrating, DO NOT MOVE THE ROBOT");
+        for (int j = 0; j <= TCS34725_SAMPLE_SIZE; j++){
+            // the sensor sampling task will fire notification based on this variable
+            calibrate_color = true;
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // wait until new sensor data is avaliable
+            temp_r += r[COLOR_SENSOR_CENTER];
+            temp_g += g[COLOR_SENSOR_CENTER];
+            temp_b += b[COLOR_SENSOR_CENTER];
+            temp_c += c[COLOR_SENSOR_CENTER];
+        }
+        calibrate_color = false;
+        temp_r = temp_r / TCS34725_SAMPLE_SIZE;
+        temp_g = temp_g / TCS34725_SAMPLE_SIZE;
+        temp_b = temp_b / TCS34725_SAMPLE_SIZE;
+        temp_c = temp_c / TCS34725_SAMPLE_SIZE;
+        normalizeRGB(temp_r, temp_g, temp_b, temp_c, normalized_calibration[i]);
+        ESP_LOGI(TCS34725_LOG_TAG, "Avg_R:%f, Avg_G:%f, Avg_B:%f, Avg_C:%f, NR:%f, NG:%f, NB:%f", temp_r, temp_g, temp_b, temp_c, normalized_calibration[i][0], normalized_calibration[i][1], normalized_calibration[i][2]);
+        ESP_LOGI(TCS34725_LOG_TAG, "Calibration for color K%d Complete! \n", i);
+    }
+
+    ESP_LOGI(TCS34725_LOG_TAG, "Starting saving calibration data to nvs...");
+    nvs_write(normalized_calibration, sizeof(normalized_calibration));
+    ESP_LOGI(TCS34725_LOG_TAG, "Successful");
+    nvs_flash_deinit();
+
+    print_normalized(normalized_calibration);
+
+    xTaskNotifyGive(uart_control_task_handler);
+    vTaskDelete(calibrate_color_sensor_task_handler);
 }
 
 void wall_detection_task(void *arg){
@@ -397,7 +610,7 @@ void mpu6050_turn_pid()
             else{
                 mpu6050_turn_pid_params.output = mpu6050_turn_pid_params.pTerm + mpu6050_turn_pid_params.iTerm;
             }
-            if (in_position_cycle_count > 5){
+            if (in_position_cycle_count > 100){
                 mpu6050_turn_pid_params.output = 0;
                 mpu6050_turn_in_position = true;
                 mpu6050_turn_command = STOP;
@@ -475,7 +688,9 @@ void wall_calibration_pid(){
             // If robot is already facing wall straight, exit the wall calibration routine
             if (in_position_cycle_count > 100){
                 wall_calibration_pid_params.output = 0;
+                in_position_cycle_count = 0;
                 wall_calibration_in_position = true;
+                xTaskNotifyGiveIndexed(maze_logic_task_handler, WALL_CALIBRATION_SLOT);
                 wall_calibration_turn_command = STOP;
             }
         }
@@ -483,27 +698,27 @@ void wall_calibration_pid(){
     }
     case STOP:
     {
-        wall_calibration_in_position = false;
         // clear pid parameters
+
+        break;
+    }
+    case RESTART:
+    {
         in_position_cycle_count = 0;
         wall_calibration_pid_params.output = 0;
         wall_calibration_pid_params.integral = 0;
         wall_calibration_pid_params.prev_err = 0;
         wall_calibration_pid_params.curr_value = 0;
-        break;
-    }
-    case RESTART:
-    {
         // Angle Z need to be manually set before setting the command to restart
         wall_calibration_turn_command = RUN;
-        in_position_cycle_count = 0;
         wall_calibration_in_position = false;
         break;
     }
     }
 }
 
-void mpu6050_turn(int angle){
+void mpu6050_turn_left(){
+    int angle = -90;
     mpu6050_turn_pid_params.target_value = angle + angleZ;
     motor_speed_task_command = RUN;
     robot_move_type = TURN;
@@ -514,13 +729,34 @@ void mpu6050_turn(int angle){
             robot_move_type = DO_NOT_MOVE;
             pid_motors[0].target_value = 0;
             pid_motors[1].target_value = 0;
+            ESP_LOGI(MAIN_LOG_TAG, "Turning in position");
             break;
         }
         // vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-void vl53_front_center_move_until(int distance){
+void mpu6050_turn_right(){
+    int angle = 90;
+    mpu6050_turn_pid_params.target_value = angle + angleZ;
+    motor_speed_task_command = RUN;
+    robot_move_type = TURN;
+    mpu6050_turn_command = RESTART;
+    while (1){
+        if (mpu6050_turn_in_position == true){
+            mpu6050_turn_in_position = false;
+            robot_move_type = DO_NOT_MOVE;
+            pid_motors[0].target_value = 0;
+            pid_motors[1].target_value = 0;
+            ESP_LOGI(MAIN_LOG_TAG, "Turning in position");
+            break;
+        }
+        // vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void vl53_front_center_move_until(void *arg){
+    int distance = 100;
     motor_speed_task_command = RUN;
     robot_move_type = STRAIGHT;
     mpu6050_move_straight_command = RESTART;
@@ -536,9 +772,11 @@ void vl53_front_center_move_until(int distance){
         }
         // vTaskDelay(pdMS_TO_TICKS(10));
     }
+    vTaskDelete(NULL);
+
 }
 
-void vl53_wall_calibration(){
+void vl53_wall_calibration(void *arg){
     robot_move_type = WALL_CALIBRATION;
     wall_calibration_turn_command = RESTART;
     motor_speed_task_command = RUN;
@@ -549,12 +787,17 @@ void vl53_wall_calibration(){
             pid_motors[0].target_value = 0;
             pid_motors[1].target_value = 0;
             break;
-        }    
-    }
+        }   
+    } 
+        vTaskDelete(NULL);
 }
 
 void debug_task(void *arg){
     while(1){
+        // ESP_LOGI(MAIN_LOG_TAG, "Global X %f", global_x);
+        // ESP_LOGI(MAIN_LOG_TAG, "Distance %lld", delta_time);
+
+
         // Print the whole rgbc as a 3x4 matrix
         // printf("\033[H\033[J");
         // printf("Angle Z: %.2f\n", angleZ);
@@ -581,14 +824,14 @@ void debug_task(void *arg){
         //         mpu6050_pid_params.output, mpu6050_pid_params.err, mpu6050_pid_params.target_value, angleZ, 
         //         mpu6050_pid_params.pTerm, mpu6050_pid_params.iTerm, mpu6050_pid_params.dTerm);
         
-        // print the debug statement for wall calibratiuon
+        // // print the debug statement for wall calibratiuon
         // printf("Wall_Calibration_Output:%f,Error:%f,TargetAngle:%f,P_Term:%f,I_Term:%f,D_Term:%f\r\n", 
         //     wall_calibration_pid_params.output, wall_calibration_pid_params.err, wall_calibration_pid_params.target_value,
         //     wall_calibration_pid_params.pTerm, wall_calibration_pid_params.iTerm, wall_calibration_pid_params.dTerm);
 
 
         // print out v left and v right
-        ESP_LOGI("Velocity", "M0:%f M1:%f", v_left, v_right);
+        // ESP_LOGI("Velocity", "M0:%f M1:%f", v_left, v_right);
 
         // ESP_LOGI("M1", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[1].output, pid_motors[1].err, pid_motors[1].target_value, pid_motors[1].curr_value, encoder_pulses[1].delta_count, pid_motors[1].pTerm, pid_motors[1].iTerm, pid_motors[1].dTerm);
         // }
@@ -598,14 +841,19 @@ void debug_task(void *arg){
 
         // ESP_LOGI("MPU6050", "Output: %f, Error: %f, Target Angle: %f, Current Angle: %f, P Term: %f, I Term: %f, D Term: %f", mpu6050_pid_params.output, mpu6050_pid_params.err, mpu6050_pid_params.target_value, angleZ, mpu6050_pid_params.pTerm, mpu6050_pid_params.iTerm, mpu6050_pid_params.dTerm);
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 void scratchpad_func(){
-
+    // motor_speed_task_command = RUN;
+    // robot_move_type = REVERSE;
+    // mpu6050_move_straight_command = RESTART;
     while (1){
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // mcpwm_comparator_set_compare_value(servo, SERVO_ANGLE_TO_COMPARATOR(175));
+        // vTaskDelay(pdMS_TO_TICKS(3000));
+        // mcpwm_comparator_set_compare_value(servo, SERVO_ANGLE_TO_COMPARATOR(0));
+        vTaskDelay(pdMS_TO_TICKS(3000));
 
         // ESP_LOGI("Main", "Moving until wall");
         // vl53_front_center_move_until(100);
@@ -627,8 +875,137 @@ void scratchpad_func(){
         return;
 }
 
+// Helper functions;
+void move_straight_gyro_H(){
+    motor_speed_task_command = RUN;
+    robot_move_type = STRAIGHT;
+    mpu6050_move_straight_command = RESTART;
+}
+
+void move_reverse_gyro_H(){
+    motor_speed_task_command = RUN;
+    robot_move_type = REVERSE;
+    mpu6050_move_straight_command = RESTART;
+}
+
+void stop_robot_H(){
+    // mpu6050_move_straight_command = STOP;
+    robot_move_type = DO_NOT_MOVE;
+    pid_motors[0].target_value = 0;
+    pid_motors[1].target_value = 0;
+}
+
+void robot_wall_calibration_H(){
+    robot_move_type = WALL_CALIBRATION;
+    wall_calibration_turn_command = RESTART;
+    motor_speed_task_command = RUN;
+    ulTaskNotifyTakeIndexed(WALL_CALIBRATION_SLOT, pdTRUE, portMAX_DELAY);
+    stop_robot_H();
+}
+
+void move_reverse_gyro_x_amount(){
+    motor_speed_task_command = RUN;
+    robot_move_type = REVERSE;
+    mpu6050_move_straight_command = RESTART;
+    // while(1){
+        // float target = global_x -
+    // }
+}
+
+void servo_blink_extrude(void *args){
+    vTaskSuspend(maze_logic_task_handler);
+    vTaskSuspend(uart_control_task_handler);
+    vTaskSuspend(color_sensor_compute_task_handler);
+    taskCommand_t motor_speed_task_command_backup = motor_speed_task_command;
+    taskCommand_t mpu6050_move_straight_command_backup = mpu6050_move_straight_command;
+    taskCommand_t mpu6050_turn_command_backup = mpu6050_turn_command;
+    taskCommand_t wall_calibration_turn_command_backup = wall_calibration_turn_command;
+    robot_move_t robot_move_type_backup = robot_move_type;
+    stop_robot_H();
+    gpio_set_level(LED3, 1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(LED3, 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(LED3, 1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(LED3, 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(LED3, 1);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    gpio_set_level(LED3, 0);
+
+    if( servo_pos == 0 ){
+        mcpwm_comparator_set_compare_value(servo, SERVO_ANGLE_TO_COMPARATOR(175));
+        servo_pos = 175;
+    }else{
+        mcpwm_comparator_set_compare_value(servo, SERVO_ANGLE_TO_COMPARATOR(0));
+        servo_pos = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(4000));
+
+    motor_speed_task_command = motor_speed_task_command_backup;
+    mpu6050_move_straight_command = mpu6050_move_straight_command_backup;
+    mpu6050_turn_command = mpu6050_turn_command_backup;
+    wall_calibration_turn_command = wall_calibration_turn_command_backup;
+    robot_move_type = robot_move_type_backup;
+    vTaskResume(maze_logic_task_handler);
+    vTaskResume(uart_control_task_handler);
+
+    vTaskDelay(3000);
+    vTaskResume(color_sensor_compute_task_handler);
+    vTaskDelete(NULL);
+
+}
+
 void maze_logic(){
     while (1){
+        // Check for sensor updates
+        // Move till front wall detected
+        while(1){
+            ESP_LOGI(MAIN_LOG_TAG, "Moving Straight Until Interrupted");
+            move_straight_gyro_H();
+            fire_wall_event = true;
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            fire_wall_event = false;
+            // If front wall, stop robot, calibrate against wall
+            if (vl53[VL53_FRONT_CENTER].detection == WALL){
+                ESP_LOGI(MAIN_LOG_TAG, "Wall Detected! Performing Wall calibration");
+                stop_robot_H();
+                // Perform wall calibration
+                robot_wall_calibration_H();
+                ESP_LOGI(MAIN_LOG_TAG, "Wall calibration done");
+                
+                if (vl53[VL53_LEFT].detection != WALL){
+                    ESP_LOGI(MAIN_LOG_TAG, "There is no left wall Detected");
+                    mpu6050_turn_left();
+                    
+                }else if (vl53[VL53z_RIGHT].detection != WALL){
+                    ESP_LOGI(MAIN_LOG_TAG, "THeres no right wall Detected");
+                    mpu6050_turn_right();
+                }else{
+                    ESP_LOGI(MAIN_LOG_TAG, "Reversing until side wall is found!");
+                    move_reverse_gyro_H();
+                    fire_side_wall_event = true;
+                    ulTaskNotifyTakeIndexed(SIDE_WALL_SLOT, pdTRUE, portMAX_DELAY);
+                    fire_side_wall_event = false;
+                    stop_robot_H();
+                    if (vl53[VL53_LEFT].detection != WALL)
+                    {
+                        ESP_LOGI(MAIN_LOG_TAG, "Left Wall not Detected");
+                        mpu6050_turn_left();
+                    }
+                    else if (vl53[VL53z_RIGHT].detection != WALL)
+                    {
+                        ESP_LOGI(MAIN_LOG_TAG, "Right Wall not Detected");
+                        mpu6050_turn_right();
+                    }
+
+                    // Move backwards towards cloest one
+                }
+            }
+        }
+
+        vTaskDelay(portMAX_DELAY);
 
     }
 }
@@ -853,12 +1230,6 @@ void servo_init(){
 
 void app_main(){
 
-    initialize_pid_controller(&pid_motors[0], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
-    initialize_pid_controller(&pid_motors[1], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
-    initialize_pid_controller(&mpu6050_pid_params, 0, PID_STRAIGHT_KP, PID_STRAIGHT_KI, PID_STRAIGHT_KD, PID_STRAIGHT_MAX_INTEGRAL, PID_STRAIGHT_MIN_INTEGRAL);
-    initialize_pid_controller(&mpu6050_turn_pid_params, 0, PID_TURN_KP, PID_TURN_KI, PID_TURN_KD, PID_TURN_MAX_INTEGRAL, PID_TURN_MIN_INTEGRAL);
-    initialize_pid_controller(&wall_calibration_pid_params, 0, WALL_CALIBRATION_KP, WALL_CALIBRATION_KI, WALL_CALIBRATION_KD, WALL_CALIBRATION_MAX_INTEGRAL, WALL_CALIBRATION_MIN_INTEGRAL);
-
     /* GPIO Configuration and Initial State */
     gpio_config_t xshut_config = {
         .intr_type = GPIO_INTR_DISABLE,
@@ -874,14 +1245,30 @@ void app_main(){
     gpio_set_level(X_SHUT_4, 0);
 
     gpio_set_level(COLOR_SENSOR_LED, 1);
+    
+    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+
+    int calibrate_sensors = gpio_get_level(BUTTON_PIN);
+    if (calibrate_sensors == 0){
+        ESP_LOGI(TCS34725_LOG_TAG, "Sensor calibration requessted!");
+    }
+
+    nvs_flash_init();
 
     mcpwm_init();
     
     pcnt_init();
 
     servo_init();
+    mcpwm_comparator_set_compare_value(servo, SERVO_ANGLE_TO_COMPARATOR(0));
 
     init_uart();
+
+    initialize_pid_controller(&pid_motors[0], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
+    initialize_pid_controller(&pid_motors[1], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
+    initialize_pid_controller(&mpu6050_pid_params, 0, PID_STRAIGHT_KP, PID_STRAIGHT_KI, PID_STRAIGHT_KD, PID_STRAIGHT_MAX_INTEGRAL, PID_STRAIGHT_MIN_INTEGRAL);
+    initialize_pid_controller(&mpu6050_turn_pid_params, 0, PID_TURN_KP, PID_TURN_KI, PID_TURN_KD, PID_TURN_MAX_INTEGRAL, PID_TURN_MIN_INTEGRAL);
+    initialize_pid_controller(&wall_calibration_pid_params, 0, WALL_CALIBRATION_KP, WALL_CALIBRATION_KI, WALL_CALIBRATION_KD, WALL_CALIBRATION_MAX_INTEGRAL, WALL_CALIBRATION_MIN_INTEGRAL);
 
     /* I2C BUS 0 Start */
     /* BUS 0 - TCS34725 with TCA95 I2C MUX */
@@ -994,12 +1381,15 @@ void app_main(){
 
     /* Initialize ESP32 Hardware TImer End */
     
-    xTaskCreatePinnedToCore(wall_detection_task, "wall_detection_task", 2048, NULL, 1, &wall_detection_task_handler, 1);
+    // Sensor detection tasks
+    // xTaskCreatePinnedToCore(wall_detection_task, "wall_detection_task", 2048, NULL, 3, &wall_detection_task_handler, 1);
+    xTaskCreatePinnedToCore(color_sensor_compute_task, "color_sensor_sampling_task", 2048, NULL, 1, &color_sensor_compute_task_handler, 1);
+
+    // Sensor sampling task
     xTaskCreatePinnedToCore(sensors_sampling_task, "sensor_sampling_task", 2048, NULL, 10, &sensor_sampling_handler, 0);
     gptimer_enable(sensor_sampling_timer);
     gptimer_start(sensor_sampling_timer);
 
-    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
     ESP_LOGI(MAIN_LOG_TAG, "Waiting for button press or uart character to start..."); 
     // wait until button is pressed or uart character is received
     uint8_t temp;
@@ -1012,15 +1402,27 @@ void app_main(){
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
     
-    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 10, NULL, 1);
+    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 10, &uart_control_task_handler, 1);
 
     xTaskCreatePinnedToCore(debug_task, "debug_task", 2048, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
+    
+    if (calibrate_sensors == 0){
+        xTaskCreatePinnedToCore(color_calibration_task, "color_calibration_task", 2048, NULL, 5, &calibrate_color_sensor_task_handler, 1);
+            // Write to NVS
+    }else{
+        ESP_LOGI(TCS34725_LOG_TAG, "Loading calibration data from nvs...");
+        nvs_read(normalized_calibration, sizeof(normalized_calibration));
+        ESP_LOGI(TCS34725_LOG_TAG, "Successful");
+        ESP_LOGI(TCS34725_LOG_TAG, "Read %f from NVS success!", normalized_calibration[0][0]);
+        nvs_flash_deinit();
+        print_normalized(normalized_calibration);
+        xTaskNotifyGive(uart_control_task_handler);
 
-    xTaskCreatePinnedToCore(color_calibration_task, "uart_control_task", 2048, NULL, 5, &calibrate_color_sensor_task_handler, 1);
+        xTaskCreatePinnedToCore(maze_logic, "maze_logic", 2048, NULL, 10, &maze_logic_task_handler, 1);
+    }
 
-    // xTaskCreatePinnedToCore(maze_logic, "maze_logic", 2048, NULL, 10, NULL, 1);
-
+    
 
     // Core 0 - time crtitical sensor sampling task
     // Core 1 - Main program logic, debug task, etc.

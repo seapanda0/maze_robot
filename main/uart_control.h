@@ -18,5 +18,6 @@ typedef struct{
 
 void init_uart();
 void uart_control_task(void *arg);
+void wait_for_character();
 
 #endif

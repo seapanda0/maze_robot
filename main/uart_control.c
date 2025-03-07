@@ -13,10 +13,28 @@
 
 const uart_port_t uart_num = UART_NUM_2;
 
+void wait_for_character()
+{
+    uint8_t data;
+    while (1){
+        int len = uart_read_bytes(uart_num, &data, 1, pdMS_TO_TICKS(50));
+        if (len > 0){
+            gpio_set_level(LED3, 1);
+            break;
+        }
+    }
+    gpio_set_level(LED3, 0);
+
+}
+
 void uart_control_task(void *arg)
 {
     uart_control_input_t *uart_control_input = (uart_control_input_t *)arg;
     char data;
+
+    // Do not start the task unless it has received a task notification
+    // Prevent collision with color sensor calibration task
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     // size_t len = 0;
     while (1){
         
@@ -26,6 +44,7 @@ void uart_control_task(void *arg)
             switch (data)
             {
             case 'w':{
+                // xTaskCreatePinnedToCore(vl53_front_center_move_until, "test", 2048, NULL, 1, NULL, 1);
                 *(uart_control_input->motor_speed_task_command) = RUN;
                 *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = 2.5;
@@ -39,19 +58,22 @@ void uart_control_task(void *arg)
                 uart_control_input->pid_motors_m2->target_value = -2.5;
                 break;
             }case 'a':{
+                // xTaskCreatePinnedToCore(mpu6050_turn_left, "test", 2048, NULL, 1, NULL, 1);
                 *(uart_control_input->motor_speed_task_command) = RUN;
                 *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = -2.5;
                 uart_control_input->pid_motors_m2->target_value = 2.5;
                 break;
             }case 'd':{
+                // xTaskCreatePinnedToCore(mpu6050_turn_right, "test", 2048, NULL, 1, NULL, 1);
                 *(uart_control_input->motor_speed_task_command) = RUN;
                 *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = 2.5;
                 uart_control_input->pid_motors_m2->target_value = -2.5;
                 break;
             }case ' ':{
-                // *(uart_control_input->motor_speed_task_command) = STOP;
+                // xTaskCreatePinnedToCore(vl53_wall_calibration, "test", 2048, NULL, 1, NULL, 1);
+                *(uart_control_input->motor_speed_task_command) = RUN;
                 *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = 0;
                 uart_control_input->pid_motors_m2->target_value = 0;

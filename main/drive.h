@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+#define WALL_CALIBRATION_SLOT 0
+#define SIDE_WALL_SLOT 1
+
 // Button Input GPIO
 #define BUTTON_PIN GPIO_NUM_15
 
@@ -69,6 +72,7 @@ typedef enum {
 typedef enum {
     TURN,
     STRAIGHT,
+    REVERSE,
     DO_NOT_MOVE,
     MANUAL,
     WALL_CALIBRATION,
@@ -79,6 +83,13 @@ typedef enum {
     WALL,
     NOT_VALID,
 } vl53_detection_t;
+
+typedef enum {
+    WALL_EVENT,
+    TILE_EVENT,
+    TREASURE_EVENT,
+} maze_event_t;
+
 
 // MPU6050 movement control PID parametes
 // THese parametes are tuned for 8ms interval
@@ -94,8 +105,8 @@ typedef enum {
 #define PID_TURN_KP 0.045
 #define PID_TURN_KI 0.000005
 #define PID_TURN_KD 0
-#define PID_TURN_MAX_INTEGRAL 0.5
-#define PID_TURN_MIN_INTEGRAL -0.5
+#define PID_TURN_MAX_INTEGRAL 1.0
+#define PID_TURN_MIN_INTEGRAL -1.
 #define PID_TURN_TOLERANCE 1
 
 
@@ -112,8 +123,8 @@ typedef enum {
 #define WALL_CALIBRATION_KP 0.02
 #define WALL_CALIBRATION_KI 0.00002
 #define WALL_CALIBRATION_KD 0
-#define WALL_CALIBRATION_MAX_INTEGRAL 0.5
-#define WALL_CALIBRATION_MIN_INTEGRAL -0.5
+#define WALL_CALIBRATION_MAX_INTEGRAL 0.6
+#define WALL_CALIBRATION_MIN_INTEGRAL -0.6
 #define WALL_CALIBRATION_TOLERANCE 3
 
 typedef struct {
@@ -159,5 +170,8 @@ void mpu6050_turn_pid();
 void wall_calibration_pid();
 void color_calibration_task(void *arg);
 void kinematics();
-
+void vl53_front_center_move_until(void *arg);
+void mpu6050_turn_right();
+void mpu6050_turn_left();
+void vl53_wall_calibration(void *arg);
 #endif

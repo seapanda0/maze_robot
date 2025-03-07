@@ -8,7 +8,18 @@
 #include "freertos/task.h"
 #include "esp_rom_sys.h"
 
-void normalizeRGB(uint32_t r, uint32_t g, uint32_t b, uint32_t c, float* norm) {
+#include <math.h>
+
+void print_normalized(float arr[7][3]){
+  printf("*****************");
+  for (int i = 0; i < 7; i++){
+    printf("NR:%f, NR:%f, NR:%f\n", arr[i][0], arr[i][1], arr[i][2]);
+  }
+  printf("*****************");
+  
+}
+
+void normalizeRGB(float r, float g, float b, float c, float* norm) {
   if (c == 0) {
     norm[0] = norm[1] = norm[2] = 0;
     return;
@@ -16,6 +27,10 @@ void normalizeRGB(uint32_t r, uint32_t g, uint32_t b, uint32_t c, float* norm) {
   norm[0] = (float)r / c;
   norm[1] = (float)g / c;
   norm[2] = (float)b / c;
+}
+
+float colorDistance(float r1, float g1, float b1, float r2, float g2, float b2) {
+  return sqrt(pow(r1 - r2, 2) + pow(g1 - g2, 2) + pow(b1 - b2, 2));
 }
 
 
