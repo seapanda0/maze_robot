@@ -12,8 +12,8 @@
 - I2C Bus 0 - 3 x TCS34725, ICA9548 I2C Mux
 - I2C Bus 1 - 5 x VL53L0X, MPU6050
 - General Purpose Timer (GPTimer) with 4ms ISR for sensor sampling task
-- MCPWM (Not yet implemented)
-- PCNT (Not yet implemented)
+- MCPWM 20kHz with comparator resolution of 2000
+- PCNT 2 Unit for 2 wheel encoder
 
 ### File Structure and Program Organization
 - `main.c` is the main code for robot logic and peripheral initialization

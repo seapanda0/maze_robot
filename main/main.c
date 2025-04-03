@@ -1,21 +1,34 @@
-#include "driver/i2c_master.h"
-#include "driver/gpio.h"
-#include "esp_timer.h"
-#include "esp_log.h"
-#include "driver/gptimer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include "driver/pulse_cnt.h"
+#include "driver/mcpwm_prelude.h"
+#include "esp_timer.h"
+#include "esp_log.h"
 
 #include "tcs34725.h"
 #include "vlx53l0x.h"
 #include "i2c_configuration.h"
 #include "mpu6050.h"
+#include "drive.h"
+
+/* GPIO Configuration */
+#define GPIO_BIT_MASK (1ULL << X_SHUT_0) | (1ULL << X_SHUT_1) | (1ULL << X_SHUT_2) | (1ULL << X_SHUT_3) | (1ULL << X_SHUT_4) \
+    | (1ULL << MOTOR_1_DIR) | (1ULL << MOTOR_2_DIR)
 
 /* I2C Device Handlers */
 i2c_master_dev_handle_t tcs34725_handle = NULL, tca95_handle = NULL;
 i2c_master_dev_handle_t mpu6050_handle = NULL;
 i2c_master_dev_handle_t vl53l0x_sensor0, vl53l0x_sensor1, vl53l0x_sensor2, vl53l0x_sensor3, vl53l0x_sensor4;
 i2c_master_dev_handle_t *vl53l0x_arr[5] = {&vl53l0x_sensor0, &vl53l0x_sensor1, &vl53l0x_sensor2, &vl53l0x_sensor3, &vl53l0x_sensor4};
+
+/* PCNT Handlers */
+pcnt_unit_handle_t encoder1 = NULL, encoder2 = NULL;
+
+/* MCPWM Comparator Handlers */
+mcpwm_cmpr_handle_t motor1 = NULL, motor2 = NULL;
 
 /* FreeRTOS Task Handlers */
 TaskHandle_t sensor_sampling_handler = NULL;
@@ -130,12 +143,11 @@ esp_err_t vl53l0x_setup_address_init(){
 }
 
 void app_main(){
-
     /* GPIO Configuration and Initial State */
     gpio_config_t xshut_config = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << X_SHUT_0) | (1ULL << X_SHUT_1) | (1ULL << X_SHUT_2) | (1ULL << X_SHUT_3) | (1ULL << X_SHUT_4),
+        .pin_bit_mask = GPIO_BIT_MASK,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_DISABLE};
     gpio_config(&xshut_config);
@@ -145,6 +157,10 @@ void app_main(){
     gpio_set_level(X_SHUT_2, 0);
     gpio_set_level(X_SHUT_3, 0);
     gpio_set_level(X_SHUT_4, 0);
+
+    mcpwm_init();
+    
+    pcnt_init();
 
     /* I2C BUS 0 Start */
     /* BUS 0 - TCS34725 with TCA95 I2C MUX */
@@ -281,4 +297,118 @@ void app_main(){
         // ESP_LOGI(TOF_LOG_TAG, "Time taken: %lld us", curr_time - prev_time);
 
     }
+}
+
+void pcnt_init(){
+    // Setup pulse counter unit
+    pcnt_unit_config_t pcnt_config = {
+        .low_limit = PCNT_LOW_LIMIT,
+        .high_limit = PCNT_HIGH_LIMIT,
+        .flags.accum_count = true
+    };
+    pcnt_new_unit(&pcnt_config, &encoder1);
+    pcnt_new_unit(&pcnt_config, &encoder2);
+
+    pcnt_unit_handle_t encoder_handle_array[2] = {encoder1, encoder2};
+
+    const gpio_num_t encoder_array[2][2] = {
+        {ENCODER1_PIN_A, ENCODER1_PIN_B},
+        {ENCODER2_PIN_A, ENCODER2_PIN_B}
+    };
+
+    // Configure 2 encoder channels
+    for (int i = 0; i < 2; i++){
+        // Setup pulse counter channel, each unit has 2 channels
+        pcnt_chan_config_t channel_a_config = {
+            .edge_gpio_num = encoder_array[i][0],
+            .level_gpio_num = encoder_array[i][1]};
+        pcnt_chan_config_t channel_b_config = {
+            .edge_gpio_num = encoder_array[i][1],
+            .level_gpio_num = encoder_array[i][0]};
+        pcnt_channel_handle_t channel_a = NULL, channel_b = NULL;
+        
+        pcnt_new_channel(encoder_handle_array[i], &channel_a_config, &channel_a);
+        pcnt_new_channel(encoder_handle_array[i], &channel_b_config, &channel_b);
+
+        // Set edge and level actions for pulse counter channels
+        pcnt_channel_set_edge_action(channel_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+        pcnt_channel_set_level_action(channel_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+        pcnt_channel_set_edge_action(channel_b, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+        pcnt_channel_set_level_action(channel_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    }
+
+    /* Add watch points, PCNT_HIGH_LIMIT and PCNT_LOW_LIMIT which is required to
+    accumulate count when the counter overflow or underflow
+    See: https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/pcnt.html#compensate-overflow-loss
+    */
+    pcnt_unit_add_watch_point(encoder1, PCNT_HIGH_LIMIT);
+    pcnt_unit_add_watch_point(encoder1, PCNT_LOW_LIMIT);
+    pcnt_unit_add_watch_point(encoder2, PCNT_HIGH_LIMIT);
+    pcnt_unit_add_watch_point(encoder2, PCNT_LOW_LIMIT);
+
+    pcnt_unit_enable(encoder1);
+    pcnt_unit_enable(encoder2);
+    pcnt_unit_clear_count(encoder1);
+    pcnt_unit_clear_count(encoder2);
+    pcnt_unit_start(encoder1);
+    pcnt_unit_start(encoder2);
+    return;
+}
+
+void mcpwm_init(){
+    // Configure mcpwm timer
+    mcpwm_timer_handle_t timer0 = NULL;
+    mcpwm_timer_config_t timer0_config = {
+        .group_id = 0,
+        .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT, // 160Mhz default clock source
+        .resolution_hz = TIMER_RESOLUTION,
+        .count_mode = MCPWM_TIMER_COUNT_MODE_UP_DOWN, //Count up down for symetric waveform to reduce harmonics when driving DC motors
+        .period_ticks = COUNTER_PERIOD
+    };
+    mcpwm_new_timer(&timer0_config, &timer0);
+
+    // Configure mcpwm operator
+    mcpwm_oper_handle_t operator0 = NULL;
+    mcpwm_operator_config_t operator0_config = {
+        .group_id = 0,
+    };
+    mcpwm_new_operator(&operator0_config, &operator0);
+    mcpwm_operator_connect_timer(operator0, timer0);
+
+    // Configure mcpwm comparator
+    mcpwm_comparator_config_t comparator_config = {
+        .flags.update_cmp_on_tep = true
+    };
+    mcpwm_new_comparator(operator0, &comparator_config, &motor1);
+    mcpwm_new_comparator(operator0, &comparator_config, &motor2);
+
+    mcpwm_gen_handle_t generator1 = NULL, generator2 = NULL;
+    mcpwm_generator_config_t generator1_config = {.gen_gpio_num = MOTOR_1_PWM};
+    mcpwm_generator_config_t generator2_config = {.gen_gpio_num = MOTOR_2_PWM};
+
+    mcpwm_new_generator(operator0, &generator1_config, &generator1);
+    mcpwm_new_generator(operator0, &generator2_config, &generator2);
+
+    /* 
+    Configure the correct wave characteristics to interface with motor driver
+    Dual Edge Symmetric Waveform - Active Low (Modified to active high)
+    https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/mcpwm.html#dual-edge-symmetric-waveform-active-low
+    */ 
+    mcpwm_generator_set_actions_on_compare_event(generator1,
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motor1, MCPWM_GEN_ACTION_LOW),
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, motor1, MCPWM_GEN_ACTION_HIGH),
+        MCPWM_GEN_COMPARE_EVENT_ACTION_END());
+    mcpwm_generator_set_actions_on_compare_event(generator2,
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motor2, MCPWM_GEN_ACTION_LOW),
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, motor2, MCPWM_GEN_ACTION_HIGH),
+        MCPWM_GEN_COMPARE_EVENT_ACTION_END());
+
+    // Set each motor to off initially
+    mcpwm_comparator_set_compare_value(motor1, 0);
+    mcpwm_comparator_set_compare_value(motor2, 0);
+
+    mcpwm_timer_enable(timer0);
+    mcpwm_timer_start_stop(timer0, MCPWM_TIMER_START_NO_STOP);
+    return;
+
 }
