@@ -9,7 +9,7 @@
 
 #define TOF_LOG_TAG "VL53L0X"
 
-#define VL53_ADDR_0 0x29 // Sensor 0 remain the original address!
+#define VL53_ADDR_0 0x28
 #define VL53_ADDR_1 0x30
 #define VL53_ADDR_2 0x31
 #define VL53_ADDR_3 0x32
@@ -18,11 +18,10 @@
 /*I2C Configuration Define End*/
 
 /*XSHUT GPIO*/
-#define X_SHUT_0 GPIO_NUM_12
-#define X_SHUT_1 GPIO_NUM_11
-#define X_SHUT_2 GPIO_NUM_10
-#define X_SHUT_3 GPIO_NUM_9
-#define X_SHUT_4 GPIO_NUM_46
+#define X_SHUT_1 GPIO_NUM_18
+#define X_SHUT_2 GPIO_NUM_17
+#define X_SHUT_3 GPIO_NUM_16
+#define X_SHUT_4 GPIO_NUM_4
 
 /* Typedef Start */
 typedef struct {
