@@ -1,12 +1,14 @@
 #ifndef DRIVE_H
 #define DRIVE_H
 
-/* PCNT and MCPWM Configurations */
+// Button Input GPIO
+#define BUTTON_PIN GPIO_NUM_15
 
-#define ENCODER1_PIN_A GPIO_NUM_36
-#define ENCODER1_PIN_B GPIO_NUM_39
-#define ENCODER2_PIN_A GPIO_NUM_34
-#define ENCODER2_PIN_B GPIO_NUM_35 // Use GPIO_NUM_34 for ESP32 (actual setup), 37 is for ESP32S3
+/* PCNT and MCPWM Configurations */
+#define ENCODER2_PIN_A GPIO_NUM_36
+#define ENCODER2_PIN_B GPIO_NUM_39
+#define ENCODER1_PIN_A GPIO_NUM_34
+#define ENCODER1_PIN_B GPIO_NUM_35 // Use GPIO_NUM_34 for ESP32 (actual setup), 37 is for ESP32S3
 
 #define PCNT_HIGH_LIMIT 32767 // Max for signed 16 bit counter
 #define PCNT_LOW_LIMIT -32768 // Min for signed 16 bit counter
@@ -20,26 +22,43 @@
 // PWM Cofiguration
 #define TIMER_RESOLUTION 80000000 // 80Mhz which is half of the 160Mhz source used
 #define COUNTER_PERIOD 4000 // 4000 ticks for 20kHz PWM used for Cytron MD10C motor driver
-#define MDPWM_COMPARATOR_MAX 1999
+#define MCPWM_COMPARATOR_MAX 1999
+
+// Servo PWM Configuration
+#define SERVO_PWM_PIN GPIO_NUM_2
+#define SERVO_PWM_RESOLUTION 1600000
+#define SERVO_COUNTER_PERIOD 32000 // 50Hz PWM for servo
+
+#define SERVO_ANGLE_TO_COMPARATOR(angle) (((angle* 3200) / 180  )+580) // 0 to 180 degrees
+
+// GPOI
+#define COLOR_SENSOR_LED GPIO_NUM_5
 
 // Encoder
 #define REDUCER_GEAR_RATIO 20.409
 #define ENCODER_PPR 13
 
-void pcnt_init();
-void mcpwm_init();
-
 typedef enum {
     RUN,
     STOP,
-    RESET
+    RESET,
+    BRAKE
 } taskCommand_t;
 
+// MPU6050 movement control PID parametes
 #define PID_STRAIGHT_KP 1
 #define PID_STRAIGHT_KI 0.1
 #define PID_STRAIGHT_KD 0
 #define PID_STRAIGHT_MAX_INTEGRAL 500
 #define PID_STRAIGHT_MIN_INTEGRAL -500
+
+// Motor speed control PID parameters
+#define MOTOR_SPEED_KP 150
+#define MOTOR_SPEED_KI 1
+#define MOTOR_SPEED_KD 0
+#define MOTOR_SPEED_MAX_INTEGRAL 500
+#define MOTOR_SPEED_MIN_INTEGRAL -500
+#define MOTOR_SPEED_PID_PERIOD 8 // 8ms
 
 typedef struct {
     float target_value;
@@ -59,6 +78,15 @@ typedef struct {
     float output;
 }pid_controller_t;
 
+typedef struct {
+    int prev_count;
+    int curr_count;
+    int delta_count;
+}encoder_pulses_t;
 
+void pcnt_init();
+void mcpwm_init();
+void motor_pid_speed_control();
+void initialize_pid_controller(pid_controller_t *pid_params, float target_value, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
 
 #endif

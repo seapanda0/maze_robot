@@ -20,7 +20,7 @@
 
 /* GPIO Configuration */
 #define GPIO_BIT_MASK (1ULL << X_SHUT_1) | (1ULL << X_SHUT_2) | (1ULL << X_SHUT_3) | (1ULL << X_SHUT_4) \
-    | (1ULL << MOTOR_1_DIR) | (1ULL << MOTOR_2_DIR)
+    | (1ULL << MOTOR_1_DIR) | (1ULL << MOTOR_2_DIR) | (1ULL << COLOR_SENSOR_LED) 
 
 /* I2C Device Handlers */
 i2c_master_dev_handle_t tcs34725_handle = NULL, tca95_handle = NULL;
@@ -33,6 +33,7 @@ pcnt_unit_handle_t encoder1 = NULL, encoder2 = NULL;
 
 /* MCPWM Comparator Handlers */
 mcpwm_cmpr_handle_t motor1 = NULL, motor2 = NULL;
+mcpwm_cmpr_handle_t servo = NULL;
 
 /* FreeRTOS Task Handlers */
 TaskHandle_t sensor_sampling_handler = NULL, move_straight_task_handler = NULL;
@@ -43,6 +44,7 @@ taskCommand_t move_straight_task_command = STOP;
 /* Variables measuring timing */
 int64_t prev_time = 0;
 int64_t curr_time = 0;
+int64_t delta_time = 0;
 
 /*Timer Variables*/
 uint32_t cycle_count = 0;
@@ -51,12 +53,17 @@ uint32_t cycle_count = 0;
 float angleZ = 0;
 uint32_t r[3] = {0}, g[3] = {0}, b[3] = {0}, c[3] = {0};
 uint16_t distances[5] = {0};
+int encoder_1_count = 0, encoder_2_count = 0;
+
+/*PID Structs*/
+pid_controller_t pid_motors[2] = {0};
+encoder_pulses_t encoder_pulses[2] = {0};
 
 bool sensors_sampling_isr_handler (gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx){
     BaseType_t xTaskawaken = pdFALSE;
     vTaskNotifyGiveFromISR(sensor_sampling_handler, &xTaskawaken);
 
-    vTaskNotifyGiveFromISR(move_straight_task_handler, &xTaskawaken);
+    // vTaskNotifyGiveFromISR(move_straight_task_handler, &xTaskawaken);
     cycle_count++;
     return xTaskawaken;
 }
@@ -70,15 +77,25 @@ void sensors_sampling_task (void *arg){
     esp_err_t status = ESP_OK;
     while(1){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
+        // prev_time = curr_time;
+        // curr_time = esp_timer_get_time();
+        // delta_time = curr_time - prev_time;
+        
         // Every cycle, 4ms, sample mpu6050
         mpu6050_updateZ(&mpu6050_handle , &angleZ);
+        
+        // Every 2 cycle , 8ms, sample wheel encoder
+        if (cycle_count % 2 == 0){
+            pcnt_unit_get_count(encoder1, &encoder_pulses[0].curr_count);
+            pcnt_unit_get_count(encoder2, &encoder_pulses[1].curr_count);
+            motor_pid_speed_control();
+        }
 
         // Every 6th cycle, 24ms, sample tcs34725
         if (cycle_count % 6 == 0){
             tcs34725_read_raw_multi(&tcs34725_handle, &tca95_handle, c, r, g, b);  // Implement error handling!!!
         }
-        // Every 9th cycle, 36ms, sample vl53l0x
+        // // Every 9th cycle, 36ms, sample vl53l0x
         if (cycle_count % 9 == 0){
             for (int i = 0; i < 4; i++){
                 status |= i2c_master_transmit_receive(*vl53l0x_arr[i], &write_buf, 1, read_buf, 2, I2C_TIMEOUT_MS);
@@ -88,8 +105,11 @@ void sensors_sampling_task (void *arg){
                 } // Implement error handling!!!
             }
         }
-        // prev_time = curr_time;
         // curr_time = esp_timer_get_time();
+        // delta_time = curr_time - prev_time;
+        // if (delta_time > 3000){
+        //     ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
+        // }
     }
 }
 
@@ -116,59 +136,68 @@ void set_motor_power(int motor1_power, int motor2_power){
 
 }
 
-void move_straight_task(void *arg){
-    pid_controller_t pid = {
-        .target_value = 0,
-        .kp = PID_STRAIGHT_KP,
-        .ki = PID_STRAIGHT_KI,
-        .kd = PID_STRAIGHT_KD,
-        .integral_limit_max = PID_STRAIGHT_MAX_INTEGRAL,
-        .integral_limit_min = PID_STRAIGHT_MIN_INTEGRAL
-    };
+void motor_pid_speed_control()
+{
+    switch (move_straight_task_command){
+    case RUN:{
+        for (int i = 0; i < 2; i++)
+        {
+            encoder_pulses[i].delta_count = (encoder_pulses[i].curr_count - encoder_pulses[i].prev_count);
+            encoder_pulses[i].prev_count = encoder_pulses[i].curr_count;
 
+            // Calculate instantaneous velocity
+            pid_motors[i].curr_value = (float)encoder_pulses[i].delta_count / (float)MOTOR_SPEED_PID_PERIOD;
+            pid_motors[i].err = pid_motors[i].target_value - pid_motors[i].curr_value;
 
-    while(1){
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        switch (move_straight_task_command){
-            case RUN: {
-            
-                // mpu6050_pid_params->err = target_angle_Z - angleZ;
-            
-                // // Calculate P term
-                // mpu6050_pid_params->pTerm = mpu6050_pid_params->kp * mpu6050_pid_params->err;
-            
-                // // Calculate I term
-                // mpu6050_pid_params->integral += mpu6050_pid_params->err;
-                // mpu6050_pid_params->iTerm = mpu6050_pid_params->ki * mpu6050_pid_params->integral;
-                // if (mpu6050_pid_params->iTerm > mpu6050_pid_params->integral_limit_max)
-                // {
-                //     mpu6050_pid_params->iTerm = mpu6050_pid_params->integral_limit_max;
-                // }
-                // else if (mpu6050_pid_params->iTerm < mpu6050_pid_params->integral_limit_min)
-                // {
-                //     mpu6050_pid_params->iTerm = mpu6050_pid_params->integral_limit_min;
-                // }
-            
-                // // Derivative not implemented
-                
-                // // Calculate output and if it is within tolerance, set output to 0
-                // if (fabs(mpu6050_pid_params->err) < mpu6050_pid_params->tolerance){
-                //     mpu6050_pid_params->output = 0;
-                // } else {
-                //     mpu6050_pid_params->output = mpu6050_pid_params->pTerm + mpu6050_pid_params->iTerm;
-                // }
+            pid_motors[i].pTerm = pid_motors[i].kp * pid_motors[i].err;
 
-                break;
+            // Calculate Integral term
+            pid_motors[i].integral += pid_motors[i].err;
+            pid_motors[i].iTerm = pid_motors[i].ki * pid_motors[i].integral;
+            if (pid_motors[i].iTerm > pid_motors[i].integral_limit_max)
+            {
+                pid_motors[i].iTerm = pid_motors[i].integral_limit_max;
             }
-            case STOP: {
-                // set_motor_speed(0, 0);
-                break;
-            }case RESET: {
-                pid.target_value = angleZ;
-                
-                break;
+            else if (pid_motors[i].iTerm < pid_motors[i].integral_limit_min)
+            {
+                pid_motors[i].iTerm = pid_motors[i].integral_limit_min;
+            }
+
+            // Calculate Derivative term
+            pid_motors[i].dTerm = pid_motors[i].kd * (pid_motors[i].err - pid_motors[i].prev_err);
+            pid_motors[i].prev_err = pid_motors[i].err;
+
+            pid_motors[i].output = (pid_motors[i].pTerm + pid_motors[i].iTerm + pid_motors[i].dTerm);
+
+            // Limit the ouput to a range within valid comparator value
+            if (pid_motors[i].output > MCPWM_COMPARATOR_MAX)
+            {
+                pid_motors[i].output = MCPWM_COMPARATOR_MAX;
+            }
+            else if (pid_motors[i].output < -MCPWM_COMPARATOR_MAX)
+            {
+                pid_motors[i].output = -MCPWM_COMPARATOR_MAX;
             }
         }
+        set_motor_power(pid_motors[0].output, pid_motors[1].output);
+        break;
+    }
+    case BRAKE:
+    {
+        set_motor_power(0, 0);
+        move_straight_task_command = STOP;
+        break;
+    }
+    case STOP:
+    {
+        break;
+    }
+    case RESET:
+    {
+        // pid.target_value = angleZ;
+
+        break;
+    }
     }
 }
 
@@ -182,83 +211,31 @@ void debug_task(void *arg){
         // printf("Sensor 2: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[1], r[1], g[1], b[1]);
         // printf("Sensor 3: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[2], r[2], g[2], b[2]);
         // fflush(stdout);
+        // for (int i = 0; i < 2; i++)
+        // {
+            ESP_LOGI("M0", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[0].output, pid_motors[0].err, pid_motors[0].target_value, pid_motors[0].curr_value, encoder_pulses[0].delta_count, pid_motors[0].pTerm, pid_motors[0].iTerm, pid_motors[0].dTerm);
+            ESP_LOGI("M1", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[1].output, pid_motors[1].err, pid_motors[1].target_value, pid_motors[1].curr_value, encoder_pulses[1].delta_count, pid_motors[1].pTerm, pid_motors[1].iTerm, pid_motors[1].dTerm);
+        // }
+        // ESP_LOGI(MAIN_LOG_TAG, "Encoder Count 1 %d Encoder Count 2 %d", encoder_pulses[0].curr_count, encoder_pulses[1].curr_count);
 
-        // ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", curr_time - prev_time);
+        // ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
 
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-
 void scratchpad_func(){
-
-        int count1, count2;
-        int prev_count1 = 0, prev_count2 = 0;
-
-        
         while (1){
-            prev_time = esp_timer_get_time();
-            pcnt_unit_get_count(encoder1, &prev_count1);
-            pcnt_unit_get_count(encoder2, &prev_count2);
-            set_motor_power(500, 500);
-            esp_rom_delay_us(4000);
-            set_motor_power(0, 0);
-            pcnt_unit_get_count(encoder1, &count1);
-            pcnt_unit_get_count(encoder2, &count2);
-            curr_time = esp_timer_get_time();
+            move_straight_task_command = RUN;
+            pid_motors[0].target_value = 6.25;
+            pid_motors[1].target_value = 6.25;
 
-
-            // Calculate the difference and speed
-            int diff1 = count1 - prev_count1;
-            int diff2 = count2 - prev_count2;
-        
-            // ESP_LOGI(MAIN_LOG_TAG, "Encoder Count 1 %d Encoder Count 2 %d", count1, count2);
-            ESP_LOGI(MAIN_LOG_TAG, "Encoder Count 1 %d Encoder Count 2 %d Time Taken %lld", diff1, diff2, curr_time - prev_time);
+            // set_motor_power(700, 700);
+            
+            vTaskDelay(pdMS_TO_TICKS(1000)); 
         }
-        
-        
-        // vTaskDelay(portMAX_DELAY); 
 
-        // uint32_t r[3] = {0}, g[3] = {0}, b[3] = {0}, c[3] = {0};
-    
-        // i2c_master_transmit(tca95_handle, &TCA95_CH1, 1, I2C_TIMEOUT_MS); // Enable TCA9548A channel 1
-
-        // gpio_set_level(MOTOR_1_DIR, 1);
-        // gpio_set_level(MOTOR_2_DIR, 1);
-        // mcpwm_comparator_set_compare_value(motor1, 400);
-        // mcpwm_comparator_set_compare_value(motor2, 400);
-        // ESP_LOGI(MAIN_LOG_TAG, "Motor 1 and 2 Forward");
-        // vTaskDelay(pdMS_TO_TICKS(1500));
-
-
-        // gpio_set_level(MOTOR_1_DIR, 0);
-        // gpio_set_level(MOTOR_2_DIR, 0);
-        // mcpwm_comparator_set_compare_value(motor1, 400);
-        // mcpwm_comparator_set_compare_value(motor2, 400);
-        // ESP_LOGI(MAIN_LOG_TAG, "Motor 1 and 2 Backward");
-        // vTaskDelay(pdMS_TO_TICKS(1500));
-
-        // prev_time = esp_timer_get_time();
-        // tcs34725_read_raw_multi(&tcs34725_handle, &tca95_handle, c, r, g, b);
-        // prev_time = curr_time;
-        // curr_time = esp_timer_get_time();
-        // Clear the previous output
-        // printf("\033[H\033[J");
-        // Print the whole rgbc as a 3x4 matrix
-        // printf("Sensor 1: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[0], r[0], g[0], b[0]);
-        // printf("Sensor 2: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[1], r[1], g[1], b[1]);
-        // printf("Sensor 3: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[2], r[2], g[2], b[2]);
-        // fflush(stdout);
-
-        // tcs34725_read_raw(&tcs34725_handle, data_raw);
-        // c = data_raw[0] | (data_raw[1] << 8);
-        // r = data_raw[2] | (data_raw[3] << 8);
-        // g = data_raw[4] | (data_raw[5] << 8);
-        // b = data_raw[6] | (data_raw[7] << 8);
-        // vTaskDelay(pdMS_TO_TICKS(3000));
-        // ESP_LOGI(TCS34725_LOG_TAG, "C: %lu, R: %lu, G: %lu, B: %lu", c, r, g, b);
-        // ESP_LOGI(TOF_LOG_TAG, "Time taken: %lld us", curr_time - prev_time);
         return;
 }
 
@@ -424,6 +401,62 @@ void mcpwm_init(){
 
 }
 
+void servo_init(){
+    // Configure mcpwm timer
+    mcpwm_timer_handle_t servo_timer = NULL;
+    mcpwm_timer_config_t servo_timer_config = {
+        .group_id = 1,
+        .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT, // 160Mhz default clock source
+        .resolution_hz = SERVO_PWM_RESOLUTION,
+        .count_mode = MCPWM_TIMER_COUNT_MODE_UP, //Count up down for symetric waveform to reduce harmonics when driving DC motors
+        .period_ticks = SERVO_COUNTER_PERIOD
+    };
+    mcpwm_new_timer(&servo_timer_config, &servo_timer);
+
+    // Configure mcpwm operator
+    mcpwm_oper_handle_t operator1 = NULL;
+    mcpwm_operator_config_t operator1_config = {
+        .group_id = 1,
+    };
+    mcpwm_new_operator(&operator1_config, &operator1);
+    mcpwm_operator_connect_timer(operator1, servo_timer);
+
+    // Configure mcpwm comparator
+    mcpwm_comparator_config_t comparator_config = {
+        .flags.update_cmp_on_tep = true
+    };
+    mcpwm_new_comparator(operator1, &comparator_config, &servo);
+
+    mcpwm_gen_handle_t generator1 = NULL;
+    mcpwm_generator_config_t generator1_config = {.gen_gpio_num = SERVO_PWM_PIN};
+
+    mcpwm_new_generator(operator1, &generator1_config, &generator1);
+
+    /* 
+    Configure the correct wave characteristics to interface with servo motor
+    Single Edge Asymmetric Waveform - Active High
+    https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/mcpwm.html#single-edge-asymmetric-waveform-active-high
+    */ 
+
+    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(generator1,
+        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
+    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(generator1,
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, servo, MCPWM_GEN_ACTION_LOW)));
+
+    // ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(generator1,
+    //         MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_FULL, MCPWM_GEN_ACTION_LOW)));
+    // ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(generator1,
+    //         MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, servo, MCPWM_GEN_ACTION_HIGH)));
+
+    // Set each motor to off initially
+    mcpwm_comparator_set_compare_value(servo, 0);
+
+    mcpwm_timer_enable(servo_timer);
+    mcpwm_timer_start_stop(servo_timer, MCPWM_TIMER_START_NO_STOP);
+    return;
+   
+}
+
 void app_main(){
     /* GPIO Configuration and Initial State */
     gpio_config_t xshut_config = {
@@ -442,6 +475,8 @@ void app_main(){
     mcpwm_init();
     
     pcnt_init();
+
+    servo_init();
 
     /* I2C BUS 0 Start */
     /* BUS 0 - TCS34725 with TCA95 I2C MUX */
@@ -555,12 +590,27 @@ void app_main(){
     /* Initialize ESP32 Hardware TImer End */
     
     xTaskCreatePinnedToCore(sensors_sampling_task, "sensor_sampling_task", 2048, NULL, 10, &sensor_sampling_handler, 0);
-    xTaskCreatePinnedToCore(move_straight_task, "sensor_sampling_task", 2048, NULL, 4, &move_straight_task_handler, 1);
+    // xTaskCreatePinnedToCore(move_straight_task, "sensor_sampling_task", 2048, NULL, 4, &move_straight_task_handler, 1);
     gptimer_enable(sensor_sampling_timer);
     gptimer_start(sensor_sampling_timer);
 
+    initialize_pid_controller(&pid_motors[0], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
+    initialize_pid_controller(&pid_motors[1], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
+
+    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+
+    ESP_LOGI(MAIN_LOG_TAG, "Waiting for button press to start...");
+    // wait until button is pressed
+    while (gpio_get_level(BUTTON_PIN) == 1){
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
     xTaskCreatePinnedToCore(debug_task, "debug_task", 2048, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(scratchpad_func, "debug_task", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
+
+
 
     // Core 0 - time crtitical sensor sampling task
     // Core 1 - Main program logic, debug task, etc.
