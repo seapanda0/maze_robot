@@ -4,6 +4,11 @@
 // Button Input GPIO
 #define BUTTON_PIN GPIO_NUM_15
 
+// LED GPIO
+#define LED1 GPIO_NUM_14
+#define LED2 GPIO_NUM_13
+#define LED3 GPIO_NUM_27
+
 /* PCNT and MCPWM Configurations */
 #define ENCODER2_PIN_A GPIO_NUM_36
 #define ENCODER2_PIN_B GPIO_NUM_39
@@ -46,18 +51,23 @@ typedef enum {
 } taskCommand_t;
 
 // MPU6050 movement control PID parametes
-#define PID_STRAIGHT_KP 1
-#define PID_STRAIGHT_KI 0.1
+// THese parametes are tuned for 8ms interval
+// Output unit of the PID controller is motor speed in pulse per second
+#define PID_STRAIGHT_KP 0.1
+#define PID_STRAIGHT_KI 0.0001
 #define PID_STRAIGHT_KD 0
-#define PID_STRAIGHT_MAX_INTEGRAL 500
-#define PID_STRAIGHT_MIN_INTEGRAL -500
+#define PID_STRAIGHT_MAX_INTEGRAL 0.5
+#define PID_STRAIGHT_MIN_INTEGRAL -0.5
+#define PID_STRAIGHT_TOLERANCE 1
 
 // Motor speed control PID parameters
-#define MOTOR_SPEED_KP 150
-#define MOTOR_SPEED_KI 1
+// THese parametes are tuned for 8ms interval
+// Maximum pulse per rotation remains untested !!!
+#define MOTOR_SPEED_KP 300
+#define MOTOR_SPEED_KI 1.5
 #define MOTOR_SPEED_KD 0
-#define MOTOR_SPEED_MAX_INTEGRAL 500
-#define MOTOR_SPEED_MIN_INTEGRAL -500
+#define MOTOR_SPEED_MAX_INTEGRAL 1000
+#define MOTOR_SPEED_MIN_INTEGRAL -1000
 #define MOTOR_SPEED_PID_PERIOD 8 // 8ms
 
 typedef struct {
@@ -87,6 +97,7 @@ typedef struct {
 void pcnt_init();
 void mcpwm_init();
 void motor_pid_speed_control();
+void mpu6050_move_straight_pid();
 void initialize_pid_controller(pid_controller_t *pid_params, float target_value, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
 
 #endif

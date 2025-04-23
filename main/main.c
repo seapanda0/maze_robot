@@ -15,12 +15,13 @@
 #include "i2c_configuration.h"
 #include "mpu6050.h"
 #include "drive.h"
+#include "uart_control.h"
 
 #define MAIN_LOG_TAG "MAIN"
 
 /* GPIO Configuration */
 #define GPIO_BIT_MASK (1ULL << X_SHUT_1) | (1ULL << X_SHUT_2) | (1ULL << X_SHUT_3) | (1ULL << X_SHUT_4) \
-    | (1ULL << MOTOR_1_DIR) | (1ULL << MOTOR_2_DIR) | (1ULL << COLOR_SENSOR_LED) 
+    | (1ULL << MOTOR_1_DIR) | (1ULL << MOTOR_2_DIR) | (1ULL << COLOR_SENSOR_LED) | (1ULL << LED1) | (1ULL << LED2) | (1ULL << LED3)
 
 /* I2C Device Handlers */
 i2c_master_dev_handle_t tcs34725_handle = NULL, tca95_handle = NULL;
@@ -39,7 +40,7 @@ mcpwm_cmpr_handle_t servo = NULL;
 TaskHandle_t sensor_sampling_handler = NULL, move_straight_task_handler = NULL;
 
 /* Task command status */
-taskCommand_t move_straight_task_command = STOP; 
+taskCommand_t motor_speed_task_command = STOP; 
 
 /* Variables measuring timing */
 int64_t prev_time = 0;
@@ -57,7 +58,23 @@ int encoder_1_count = 0, encoder_2_count = 0;
 
 /*PID Structs*/
 pid_controller_t pid_motors[2] = {0};
+pid_controller_t mpu6050_pid_params = {0};
 encoder_pulses_t encoder_pulses[2] = {0};
+
+/*Motor controls*/
+float basespeed_m0 = 6.5;
+float basespeed_m1 = 6.5;
+
+/*Manual Overrides Via UART*/
+char keyboard_input = 0;
+uart_control_input_t uart_task_args = {
+    .pid_motors_m1 = &pid_motors[0],
+    .pid_motors_m2 = &pid_motors[1],
+    .motor_speed_task_command = &motor_speed_task_command,
+    .motor1_comparator = &motor1,
+    .motor2_comparator = &motor2,
+};
+
 
 bool sensors_sampling_isr_handler (gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx){
     BaseType_t xTaskawaken = pdFALSE;
@@ -77,17 +94,19 @@ void sensors_sampling_task (void *arg){
     esp_err_t status = ESP_OK;
     while(1){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        // prev_time = curr_time;
-        // curr_time = esp_timer_get_time();
+        // prev_time = esp_timer_get_time();
         // delta_time = curr_time - prev_time;
         
         // Every cycle, 4ms, sample mpu6050
         mpu6050_updateZ(&mpu6050_handle , &angleZ);
         
-        // Every 2 cycle , 8ms, sample wheel encoder
+        // Every 2 cycle , 8ms, sample wheel encoder and perform PID control
         if (cycle_count % 2 == 0){
             pcnt_unit_get_count(encoder1, &encoder_pulses[0].curr_count);
             pcnt_unit_get_count(encoder2, &encoder_pulses[1].curr_count);
+            // mpu6050_move_straight_pid();
+            // pid_motors[0].target_value = basespeed_m0 + mpu6050_pid_params.output;
+            // pid_motors[1].target_value = basespeed_m0 - mpu6050_pid_params.output;
             motor_pid_speed_control();
         }
 
@@ -95,7 +114,7 @@ void sensors_sampling_task (void *arg){
         if (cycle_count % 6 == 0){
             tcs34725_read_raw_multi(&tcs34725_handle, &tca95_handle, c, r, g, b);  // Implement error handling!!!
         }
-        // // Every 9th cycle, 36ms, sample vl53l0x
+        // Every 9th cycle, 36ms, sample vl53l0x
         if (cycle_count % 9 == 0){
             for (int i = 0; i < 4; i++){
                 status |= i2c_master_transmit_receive(*vl53l0x_arr[i], &write_buf, 1, read_buf, 2, I2C_TIMEOUT_MS);
@@ -105,6 +124,7 @@ void sensors_sampling_task (void *arg){
                 } // Implement error handling!!!
             }
         }
+        // prev_time = curr_time;
         // curr_time = esp_timer_get_time();
         // delta_time = curr_time - prev_time;
         // if (delta_time > 3000){
@@ -138,7 +158,7 @@ void set_motor_power(int motor1_power, int motor2_power){
 
 void motor_pid_speed_control()
 {
-    switch (move_straight_task_command){
+    switch (motor_speed_task_command){
     case RUN:{
         for (int i = 0; i < 2; i++)
         {
@@ -163,9 +183,9 @@ void motor_pid_speed_control()
                 pid_motors[i].iTerm = pid_motors[i].integral_limit_min;
             }
 
-            // Calculate Derivative term
-            pid_motors[i].dTerm = pid_motors[i].kd * (pid_motors[i].err - pid_motors[i].prev_err);
-            pid_motors[i].prev_err = pid_motors[i].err;
+            // // Calculate Derivative term
+            // pid_motors[i].dTerm = pid_motors[i].kd * (pid_motors[i].err - pid_motors[i].prev_err);
+            // pid_motors[i].prev_err = pid_motors[i].err;
 
             pid_motors[i].output = (pid_motors[i].pTerm + pid_motors[i].iTerm + pid_motors[i].dTerm);
 
@@ -184,8 +204,12 @@ void motor_pid_speed_control()
     }
     case BRAKE:
     {
+        pid_motors[0].target_value = 0;
+        pid_motors[1].target_value = 0;
+        pid_motors[0].integral = 0;
+        pid_motors[1].integral = 0;
         set_motor_power(0, 0);
-        move_straight_task_command = STOP;
+        motor_speed_task_command = STOP;
         break;
     }
     case STOP:
@@ -201,6 +225,37 @@ void motor_pid_speed_control()
     }
 }
 
+void mpu6050_move_straight_pid(){
+    
+
+    mpu6050_pid_params.err = mpu6050_pid_params.target_value - angleZ;
+
+    // Calculate P term
+    mpu6050_pid_params.pTerm = mpu6050_pid_params.kp * mpu6050_pid_params.err;
+
+    // Calculate I term
+    mpu6050_pid_params.integral += mpu6050_pid_params.err;
+    mpu6050_pid_params.iTerm = mpu6050_pid_params.ki * mpu6050_pid_params.integral;
+    if (mpu6050_pid_params.iTerm > mpu6050_pid_params.integral_limit_max)
+    {
+        mpu6050_pid_params.iTerm = mpu6050_pid_params.integral_limit_max;
+    }
+    else if (mpu6050_pid_params.iTerm < mpu6050_pid_params.integral_limit_min)
+    {
+        mpu6050_pid_params.iTerm = mpu6050_pid_params.integral_limit_min;
+    }
+
+    // Derivative not implemented
+    
+    // Calculate output and if it is within tolerance, set output to 0
+    if (fabs(mpu6050_pid_params.err) < PID_STRAIGHT_TOLERANCE){
+        mpu6050_pid_params.output = 0;
+    } else {
+        mpu6050_pid_params.output = mpu6050_pid_params.pTerm + mpu6050_pid_params.iTerm;
+    }
+
+}
+
 void debug_task(void *arg){
     while(1){
         // Print the whole rgbc as a 3x4 matrix
@@ -213,13 +268,15 @@ void debug_task(void *arg){
         // fflush(stdout);
         // for (int i = 0; i < 2; i++)
         // {
-            ESP_LOGI("M0", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[0].output, pid_motors[0].err, pid_motors[0].target_value, pid_motors[0].curr_value, encoder_pulses[0].delta_count, pid_motors[0].pTerm, pid_motors[0].iTerm, pid_motors[0].dTerm);
-            ESP_LOGI("M1", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[1].output, pid_motors[1].err, pid_motors[1].target_value, pid_motors[1].curr_value, encoder_pulses[1].delta_count, pid_motors[1].pTerm, pid_motors[1].iTerm, pid_motors[1].dTerm);
+        // ESP_LOGI("M0", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[0].output, pid_motors[0].err, pid_motors[0].target_value, pid_motors[0].curr_value, encoder_pulses[0].delta_count, pid_motors[0].pTerm, pid_motors[0].iTerm, pid_motors[0].dTerm);
+        printf("Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f\r\n", pid_motors[0].output, pid_motors[0].err, pid_motors[0].target_value, pid_motors[0].curr_value, encoder_pulses[0].delta_count, pid_motors[0].pTerm, pid_motors[0].iTerm, pid_motors[0].dTerm);
+        // ESP_LOGI("M1", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[1].output, pid_motors[1].err, pid_motors[1].target_value, pid_motors[1].curr_value, encoder_pulses[1].delta_count, pid_motors[1].pTerm, pid_motors[1].iTerm, pid_motors[1].dTerm);
         // }
         // ESP_LOGI(MAIN_LOG_TAG, "Encoder Count 1 %d Encoder Count 2 %d", encoder_pulses[0].curr_count, encoder_pulses[1].curr_count);
 
         // ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
 
+        // ESP_LOGI("MPU6050", "Output: %f, Error: %f, Target Angle: %f, Current Angle: %f, P Term: %f, I Term: %f, D Term: %f", mpu6050_pid_params.output, mpu6050_pid_params.err, mpu6050_pid_params.target_value, angleZ, mpu6050_pid_params.pTerm, mpu6050_pid_params.iTerm, mpu6050_pid_params.dTerm);
 
         // vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -227,9 +284,9 @@ void debug_task(void *arg){
 
 void scratchpad_func(){
         while (1){
-            move_straight_task_command = RUN;
-            pid_motors[0].target_value = 6.25;
-            pid_motors[1].target_value = 6.25;
+            // motor_speed_task_command = RUN;
+            // pid_motors[0].target_value = 6.25;
+            // pid_motors[1].target_value = 6.25;
 
             // set_motor_power(700, 700);
             
@@ -458,6 +515,10 @@ void servo_init(){
 }
 
 void app_main(){
+    initialize_pid_controller(&pid_motors[0], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
+    initialize_pid_controller(&pid_motors[1], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
+    initialize_pid_controller(&mpu6050_pid_params, 0, PID_STRAIGHT_KP, PID_STRAIGHT_KI, PID_STRAIGHT_KD, PID_STRAIGHT_MAX_INTEGRAL, PID_STRAIGHT_MIN_INTEGRAL);
+
     /* GPIO Configuration and Initial State */
     gpio_config_t xshut_config = {
         .intr_type = GPIO_INTR_DISABLE,
@@ -477,6 +538,8 @@ void app_main(){
     pcnt_init();
 
     servo_init();
+
+    init_uart();
 
     /* I2C BUS 0 Start */
     /* BUS 0 - TCS34725 with TCA95 I2C MUX */
@@ -590,33 +653,25 @@ void app_main(){
     /* Initialize ESP32 Hardware TImer End */
     
     xTaskCreatePinnedToCore(sensors_sampling_task, "sensor_sampling_task", 2048, NULL, 10, &sensor_sampling_handler, 0);
-    // xTaskCreatePinnedToCore(move_straight_task, "sensor_sampling_task", 2048, NULL, 4, &move_straight_task_handler, 1);
     gptimer_enable(sensor_sampling_timer);
     gptimer_start(sensor_sampling_timer);
 
-    initialize_pid_controller(&pid_motors[0], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
-    initialize_pid_controller(&pid_motors[1], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
 
-    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 1, NULL, 1);
 
-    ESP_LOGI(MAIN_LOG_TAG, "Waiting for button press to start...");
-    // wait until button is pressed
-    while (gpio_get_level(BUTTON_PIN) == 1){
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    
+    // gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+    // ESP_LOGI(MAIN_LOG_TAG, "Waiting for button press to start..."); 
+    // // wait until button is pressed
+    // while (gpio_get_level(BUTTON_PIN) == 1){
+    //     vTaskDelay(pdMS_TO_TICKS(100));
+    // }
+    // vTaskDelay(pdMS_TO_TICKS(1500));
 
     xTaskCreatePinnedToCore(debug_task, "debug_task", 2048, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
 
-
-
     // Core 0 - time crtitical sensor sampling task
     // Core 1 - Main program logic, debug task, etc.
 
-    // while(1){
-
-
-    // }
 }
