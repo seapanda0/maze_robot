@@ -47,28 +47,45 @@ typedef enum {
     RUN,
     STOP,
     RESET,
-    BRAKE
+    BRAKE,
+    START,
 } taskCommand_t;
+
+typedef enum {
+    TURN,
+    STRAIGHT,
+} mpu6050_move_t;
 
 // MPU6050 movement control PID parametes
 // THese parametes are tuned for 8ms interval
 // Output unit of the PID controller is motor speed in pulse per second
-#define PID_STRAIGHT_KP 0.1
-#define PID_STRAIGHT_KI 0.0001
+#define PID_STRAIGHT_KP 0.07
+#define PID_STRAIGHT_KI 0.00001
 #define PID_STRAIGHT_KD 0
 #define PID_STRAIGHT_MAX_INTEGRAL 0.5
 #define PID_STRAIGHT_MIN_INTEGRAL -0.5
 #define PID_STRAIGHT_TOLERANCE 1
 
+// MPU6050 Turning PID Parameters
+#define PID_TURN_KP 0.07
+#define PID_TURN_KI 0.00001
+#define PID_TURN_KD 0
+#define PID_TURN_MAX_INTEGRAL 0.5
+#define PID_TURN_MIN_INTEGRAL -0.5
+#define PID_TURN_TOLERANCE 1
+
+
 // Motor speed control PID parameters
 // THese parametes are tuned for 8ms interval
 // Maximum pulse per rotation remains untested !!!
-#define MOTOR_SPEED_KP 300
-#define MOTOR_SPEED_KI 1.5
+#define MOTOR_SPEED_KP 200
+#define MOTOR_SPEED_KI 20
 #define MOTOR_SPEED_KD 0
-#define MOTOR_SPEED_MAX_INTEGRAL 1000
-#define MOTOR_SPEED_MIN_INTEGRAL -1000
+#define MOTOR_SPEED_MAX_INTEGRAL 1800
+#define MOTOR_SPEED_MIN_INTEGRAL -1800
 #define MOTOR_SPEED_PID_PERIOD 8 // 8ms
+
+
 
 typedef struct {
     float target_value;
@@ -99,5 +116,5 @@ void mcpwm_init();
 void motor_pid_speed_control();
 void mpu6050_move_straight_pid();
 void initialize_pid_controller(pid_controller_t *pid_params, float target_value, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
-
+void mpu6050_turn_pid();
 #endif
