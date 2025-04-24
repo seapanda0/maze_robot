@@ -46,14 +46,14 @@
 typedef enum {
     RUN,
     STOP,
-    RESET,
-    BRAKE,
-    START,
+    RESTART,
 } taskCommand_t;
 
+// used for deciding the type of movement
 typedef enum {
     TURN,
     STRAIGHT,
+    DO_NOT_MOVE,
 } mpu6050_move_t;
 
 // MPU6050 movement control PID parametes
@@ -67,7 +67,7 @@ typedef enum {
 #define PID_STRAIGHT_TOLERANCE 1
 
 // MPU6050 Turning PID Parameters
-#define PID_TURN_KP 0.07
+#define PID_TURN_KP 0.055
 #define PID_TURN_KI 0.00001
 #define PID_TURN_KD 0
 #define PID_TURN_MAX_INTEGRAL 0.5
@@ -115,6 +115,7 @@ void pcnt_init();
 void mcpwm_init();
 void motor_pid_speed_control();
 void mpu6050_move_straight_pid();
+void set_motor_speed();
 void initialize_pid_controller(pid_controller_t *pid_params, float target_value, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
 void mpu6050_turn_pid();
 #endif

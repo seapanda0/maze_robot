@@ -47,9 +47,9 @@ void uart_control_task(void *arg)
                 uart_control_input->pid_motors_m2->target_value = -2.5;
                 break;
             }case ' ':{
-                *(uart_control_input->motor_speed_task_command) = BRAKE;
-                // uart_control_input->pid_motors_m1->target_value = 0;
-                // uart_control_input->pid_motors_m2->target_value = 0;
+                // *(uart_control_input->motor_speed_task_command) = STOP;
+                uart_control_input->pid_motors_m1->target_value = 0;
+                uart_control_input->pid_motors_m2->target_value = 0;
                 break;}
 
         }

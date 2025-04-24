@@ -38,10 +38,12 @@ mcpwm_cmpr_handle_t servo = NULL;
 
 /* FreeRTOS Task Handlers */
 TaskHandle_t sensor_sampling_handler = NULL, move_straight_task_handler = NULL;
+TaskHandle_t wall_detection_task_handler = NULL;
 
 /* Task command status */
 taskCommand_t motor_speed_task_command = STOP; 
 taskCommand_t mpu6050_move_straight_command = STOP; 
+taskCommand_t mpu6050_turn_command = STOP; 
 mpu6050_move_t mpu6050_move_type = STRAIGHT;
 
 /* Variables measuring timing */
@@ -79,7 +81,6 @@ uart_control_input_t uart_task_args = {
     .motor2_comparator = &motor2,
 };
 
-
 bool sensors_sampling_isr_handler (gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx){
     BaseType_t xTaskawaken = pdFALSE;
     vTaskNotifyGiveFromISR(sensor_sampling_handler, &xTaskawaken);
@@ -103,21 +104,40 @@ void sensors_sampling_task (void *arg){
         
         // Every cycle, 4ms, sample mpu6050
         mpu6050_updateZ(&mpu6050_handle , &angleZ);
-        
+
         // Every 2 cycle , 8ms, sample wheel encoder and perform PID control
-        if (cycle_count % 2 == 0){
+        if (cycle_count % 2 == 0)
+        {
+            switch (mpu6050_move_type)
+            {
+            case STRAIGHT:{
+                mpu6050_move_straight_pid();
+                pid_motors[0].target_value = basespeed_m0 + mpu6050_pid_params.output;
+                pid_motors[1].target_value = basespeed_m0 - mpu6050_pid_params.output;
+                break;
+            }
+            case TURN:{
+                mpu6050_turn_pid();
+                // ESP_LOGI(MAIN_LOG_TAG, "Turn PID Output: %f", mpu6050_turn_pid_params.output);
+                if (mpu6050_turn_pid_params.output > 0)
+                {
+                    pid_motors[0].target_value = mpu6050_turn_pid_params.output;
+                    pid_motors[1].target_value = 0;
+                }
+                else if (mpu6050_turn_pid_params.output < 0)
+                {
+                    pid_motors[0].target_value = 0;
+                    pid_motors[1].target_value = -mpu6050_turn_pid_params.output;
+                }
+                break;
+            }case DO_NOT_MOVE:{
+                pid_motors[0].target_value = 0;
+                pid_motors[1].target_value = 0;
+                break;
+            }
+            }
             pcnt_unit_get_count(encoder1, &encoder_pulses[0].curr_count);
             pcnt_unit_get_count(encoder2, &encoder_pulses[1].curr_count);
-            switch (mpu6050_move_type){
-                case STRAIGHT:{
-                    mpu6050_move_straight_pid();
-                    break;
-                }case TURN:{
-                    mpu6050_turn_pid();
-                    break;
-                }
-            }
-            mpu6050_move_straight_pid();
             motor_pid_speed_control();
         }
 
@@ -127,13 +147,15 @@ void sensors_sampling_task (void *arg){
         }
         // Every 9th cycle, 36ms, sample vl53l0x
         if (cycle_count % 9 == 0){
-            for (int i = 0; i < 4; i++){
+            for (int i = 0; i < 5; i++){
                 status |= i2c_master_transmit_receive(*vl53l0x_arr[i], &write_buf, 1, read_buf, 2, I2C_TIMEOUT_MS);
                 status |= i2c_master_transmit(*vl53l0x_arr[i], write_buf_clear, 2 , I2C_TIMEOUT_MS);
                 if (status == ESP_OK) {        
                     distances[i] = read_buf[1] | (read_buf[0] << 8);
                 } // Implement error handling!!!
             }
+            xTaskNotifyGive(wall_detection_task_handler);
+            
         }
         // prev_time = curr_time;
         // curr_time = esp_timer_get_time();
@@ -141,6 +163,20 @@ void sensors_sampling_task (void *arg){
         // if (delta_time > 3000){
         //     ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
         // }
+    }
+}
+
+void wall_detection_task(void *arg){
+    while(1){
+        // Wait for the task to be notified
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Perform wall detection logic here
+        // For example, check the distance from the sensors and take action
+        for (int i = 0; i < 5; i++){
+            if (distances[i] < 1000){ // Example threshold
+                ESP_LOGI(MAIN_LOG_TAG, "Wall detected by sensor %d", i);
+            }
+        }
     }
 }
 
@@ -163,14 +199,16 @@ void set_motor_power(int motor1_power, int motor2_power){
     mcpwm_comparator_set_compare_value(motor2, abs(motor2_power));
     gpio_set_level(MOTOR_1_DIR, dir1);
     gpio_set_level(MOTOR_2_DIR, dir2);
+}
 
-
+void set_motor_speed(int motor1_speed, int motor2_speed){
+    pid_motors[0].target_value = motor1_speed;
+    pid_motors[1].target_value = motor2_speed;
 }
 
 void motor_pid_speed_control()
 {
-    switch (motor_speed_task_command)
-    {
+    switch (motor_speed_task_command){
     case RUN:
     {
         for (int i = 0; i < 2; i++)
@@ -215,29 +253,11 @@ void motor_pid_speed_control()
         set_motor_power(pid_motors[0].output, pid_motors[1].output);
         break;
     }
-    case BRAKE:
-    {
-        set_motor_power(0, 0);
-        pid_motors[0].target_value = 0;
-        pid_motors[1].target_value = 0;
-        pid_motors[0].integral = 0;
-        pid_motors[1].integral = 0;
-        motor_speed_task_command = STOP;
-        break;
-    }
     case STOP:
     {
         break;
-    }
-    case RESET:
-    {
-        // pid.target_value = angleZ;
-
-        break;
-    }
-    default:
-    {
-        // Do nothing
+    }case RESTART:{
+        motor_speed_task_command = RUN;
         break;
     }
     }
@@ -271,24 +291,19 @@ void mpu6050_move_straight_pid(){
             } else {
                 mpu6050_pid_params.output = mpu6050_pid_params.pTerm + mpu6050_pid_params.iTerm;
             }
-            pid_motors[0].target_value = basespeed_m0 + mpu6050_pid_params.output;
-            pid_motors[1].target_value = basespeed_m0 - mpu6050_pid_params.output;
+
             break;
             
-        }case RESET:{
-            pid_motors[0].target_value = 0;
-            pid_motors[1].target_value = 0;
+        }case STOP:{
+            mpu6050_pid_params.output = 0;
+            mpu6050_pid_params.prev_err = 0;
             mpu6050_pid_params.target_value = 0;
             mpu6050_pid_params.integral = 0;
-            mpu6050_move_straight_command = STOP;
             break;
-        }case START:{
+        }case RESTART:{
             // Every time the task is started, use current angleZ as target
             mpu6050_pid_params.target_value = angleZ;
             mpu6050_move_straight_command = RUN;
-            break;
-        }default:{
-            // Do nothing
             break;
         }
     }
@@ -296,51 +311,79 @@ void mpu6050_move_straight_pid(){
 
 void mpu6050_turn_pid()
 {
-    mpu6050_turn_pid_params.err = mpu6050_turn_pid_params.target_value - angleZ;
+    static int in_position_cycle_count = 0;
+    switch(mpu6050_turn_command){
+        case RUN:{
+            mpu6050_turn_pid_params.err = mpu6050_turn_pid_params.target_value - angleZ;
 
-    // Calculate P term
-    mpu6050_turn_pid_params.pTerm = mpu6050_turn_pid_params.kp * mpu6050_turn_pid_params.err;
+            // Calculate P term
+            mpu6050_turn_pid_params.pTerm = mpu6050_turn_pid_params.kp * mpu6050_turn_pid_params.err;
+        
+            // Calculate I term
+            mpu6050_turn_pid_params.integral += mpu6050_turn_pid_params.err;
+            mpu6050_turn_pid_params.iTerm = mpu6050_turn_pid_params.ki * mpu6050_turn_pid_params.integral;
+            if (mpu6050_turn_pid_params.iTerm > mpu6050_turn_pid_params.integral_limit_max)
+            {
+                mpu6050_turn_pid_params.iTerm = mpu6050_turn_pid_params.integral_limit_max;
+            }
+            else if (mpu6050_turn_pid_params.iTerm < mpu6050_turn_pid_params.integral_limit_min)
+            {
+                mpu6050_turn_pid_params.iTerm = mpu6050_turn_pid_params.integral_limit_min;
+            }
+        
+            // Derivative not implemented
+        
+            // Calculate output and if it is within tolerance, set output to 0
+            if (fabs(mpu6050_turn_pid_params.err) < PID_STRAIGHT_TOLERANCE)
+            {
+                in_position_cycle_count++;
+                mpu6050_turn_pid_params.output = 0;
+            }
+            else{
+                mpu6050_turn_pid_params.output = mpu6050_turn_pid_params.pTerm + mpu6050_turn_pid_params.iTerm;
+            }
+            if (in_position_cycle_count > 5){
+                mpu6050_turn_pid_params.output = 0;
+                mpu6050_turn_in_position = true;
+                mpu6050_turn_command = STOP;
+            }
+        
+            // if (mpu6050_turn_pid_params.output > 0){
+            //     pid_motors[0].target_value = mpu6050_turn_pid_params.output;
+            //     pid_motors[1].target_value = 0;
+            // }else if (mpu6050_turn_pid_params.output < 0){
+            //     pid_motors[0].target_value = 0;
+            //     pid_motors[1].target_value = -mpu6050_turn_pid_params.output;
+            // }
+            break;
+        }case STOP:{
+            //clear pid parameters
+            in_position_cycle_count = 0;
+            mpu6050_turn_pid_params.output = 0;
+            mpu6050_turn_pid_params.integral = 0;
+            mpu6050_turn_pid_params.prev_err = 0;
+            mpu6050_turn_pid_params.curr_value = 0;
+            break;
 
-    // Calculate I term
-    mpu6050_turn_pid_params.integral += mpu6050_turn_pid_params.err;
-    mpu6050_turn_pid_params.iTerm = mpu6050_turn_pid_params.ki * mpu6050_turn_pid_params.integral;
-    if (mpu6050_turn_pid_params.iTerm > mpu6050_turn_pid_params.integral_limit_max)
-    {
-        mpu6050_turn_pid_params.iTerm = mpu6050_turn_pid_params.integral_limit_max;
+        }case RESTART:{
+            // Angle Z need to be manually set before setting the command to restart
+            mpu6050_turn_command = RUN;
+            in_position_cycle_count = 0;
+            mpu6050_turn_in_position = false;
+            break;
+        }
     }
-    else if (mpu6050_turn_pid_params.iTerm < mpu6050_turn_pid_params.integral_limit_min)
-    {
-        mpu6050_turn_pid_params.iTerm = mpu6050_turn_pid_params.integral_limit_min;
-    }
-
-    // Derivative not implemented
-
-    // Calculate output and if it is within tolerance, set output to 0
-    if (fabs(mpu6050_turn_pid_params.err) < PID_STRAIGHT_TOLERANCE)
-    {
-        mpu6050_turn_pid_params.output = 0;
-        mpu6050_turn_in_position = true;
-    }
-    else{
-        mpu6050_turn_in_position = false;
-        mpu6050_turn_pid_params.output = mpu6050_turn_pid_params.pTerm + mpu6050_turn_pid_params.iTerm;
-    }
-
-    if (mpu6050_turn_pid_params.output > 0){
-        pid_motors[0].target_value = mpu6050_turn_pid_params.output;
-        pid_motors[1].target_value = 0;
-    }else if (mpu6050_turn_pid_params.output < 0){
-        pid_motors[0].target_value = 0;
-        pid_motors[1].target_value = -mpu6050_turn_pid_params.output;
-    }
+    
 }
 
 void mpu6050_turn(int angle){
     mpu6050_turn_pid_params.target_value = angle + angleZ;
+    mpu6050_turn_command = RESTART;
     mpu6050_move_type = TURN;
     motor_speed_task_command = RUN;
     while (1){
         if (mpu6050_turn_in_position == true){
+            mpu6050_move_type = DO_NOT_MOVE;
             pid_motors[0].target_value = 0;
             pid_motors[1].target_value = 0;
             break;
@@ -351,14 +394,16 @@ void mpu6050_turn(int angle){
 
 void vl53_front_center_move_until(int distance){
     motor_speed_task_command = RUN;
-    mpu6050_move_straight_command = START;
+    mpu6050_move_straight_command = RESTART;
+    mpu6050_move_type = STRAIGHT;
     while (1){
         // Arbitrary added a 20mm!!! Test again!!!
         if (distances[0] < distance + 20){
-            mpu6050_move_straight_command = RESET;
+            ESP_LOGI(MAIN_LOG_TAG, "Distance: %u", distances[0]);
+            mpu6050_move_straight_command = STOP;
+            mpu6050_move_type = DO_NOT_MOVE;
             pid_motors[0].target_value = 0;
             pid_motors[1].target_value = 0;
-            // motor_speed_task_command = BRAKE;
             break;
         }
         // vTaskDelay(pdMS_TO_TICKS(10));
@@ -412,8 +457,13 @@ void scratchpad_func(){
             
             vTaskDelay(pdMS_TO_TICKS(1000)); 
         }
-
         return;
+}
+
+void maze_logic(){
+    while (1){
+
+    }
 }
 
 esp_err_t vl53l0x_setup_address_init(i2c_master_bus_handle_t bus1){
@@ -443,14 +493,14 @@ esp_err_t vl53l0x_setup_address_init(i2c_master_bus_handle_t bus1){
     vTaskDelay(pdMS_TO_TICKS(10));
     status |= setAddress(VL53_ADDR_3, 3); // Set sensor 3 to address 3
 
-    // gpio_set_level(X_SHUT_4, 1); // Select sensor 4
-    // vTaskDelay(pdMS_TO_TICKS(10));
-    // status |= setAddress(VL53_ADDR_4, 4); // Set sensor 3 to address 3
+    gpio_set_level(X_SHUT_4, 1); // Select sensor 4
+    vTaskDelay(pdMS_TO_TICKS(10));
+    status |= setAddress(VL53_ADDR_4, 4); // Set sensor 4 to address 4
 
     /* Address Changing End */
 
     /* Initialize all 5 sensors start */
-    for (int i = 0; i < 4; i++){
+    for (int i = 0; i < 5;i++){
         vl53l0x_handle = vl53l0x_arr[i];
         if (init()){
             startContinuous(0);
@@ -791,7 +841,11 @@ void app_main(){
     vTaskDelay(pdMS_TO_TICKS(1500));
 
     xTaskCreatePinnedToCore(debug_task, "debug_task", 2048, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
+    // xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
+
+    // xTaskCreatePinnedToCore(wall_detection_task, "wall_detection_task", 2048, NULL, 1, &, &wall_detection_task_handler, 1);
+    // xTaskCreatePinnedToCore(maze_logic, "maze_logic", 2048, NULL, 10, NULL, 1);
+
 
     // Core 0 - time crtitical sensor sampling task
     // Core 1 - Main program logic, debug task, etc.
