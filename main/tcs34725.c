@@ -8,6 +8,17 @@
 #include "freertos/task.h"
 #include "esp_rom_sys.h"
 
+void normalizeRGB(uint32_t r, uint32_t g, uint32_t b, uint32_t c, float* norm) {
+  if (c == 0) {
+    norm[0] = norm[1] = norm[2] = 0;
+    return;
+  }
+  norm[0] = (float)r / c;
+  norm[1] = (float)g / c;
+  norm[2] = (float)b / c;
+}
+
+
 // Constants
 const uint8_t tca95_channel[3] = {TCA95_CH1, TCA95_CH2, TCA95_CH3};
 const uint8_t tcs34725_command_cdata = TCS34725_COMMAND | TCS34725_CDATA;
@@ -31,7 +42,7 @@ esp_err_t tcs34725_init(i2c_master_dev_handle_t *tcs34725_handle){
 
   // Set gain
   buf8_arr[0]= TCS34725_COMMAND | TCS34725_CONTROL;
-  buf8_arr[1]= TCS34725_AGAIN;
+  buf8_arr[1]= TCS34725_GAIN_16X;
   status |= i2c_master_transmit(*tcs34725_handle, buf8_arr, 2, I2C_TIMEOUT_MS);
   status |= i2c_master_transmit(*tcs34725_handle, buf8_arr, 2, I2C_TIMEOUT_MS);
   
@@ -61,7 +72,6 @@ esp_err_t tcs34725_init_multi(i2c_master_dev_handle_t *tcs34725_handle, i2c_mast
   status |= tcs34725_init(tcs34725_handle);
   return status;
 }
-
 
 /* Read a single sensor connected to the microcontroller */
 esp_err_t tcs34725_read_raw (i2c_master_dev_handle_t *tcs34725_handle, uint8_t * buf){

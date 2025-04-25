@@ -40,6 +40,7 @@ mcpwm_cmpr_handle_t servo = NULL;
 /* FreeRTOS Task Handlers */
 TaskHandle_t sensor_sampling_handler = NULL, move_straight_task_handler = NULL;
 TaskHandle_t wall_detection_task_handler = NULL;
+TaskHandle_t calibrate_color_sensor_task_handler = NULL;
 
 /* Task command status */
 taskCommand_t motor_speed_task_command = STOP; 
@@ -85,6 +86,10 @@ uart_control_input_t uart_task_args = {
     .motor1_comparator = &motor1,
     .motor2_comparator = &motor2,
 };
+
+/*Color calibration state*/
+bool calibrate_color = false;
+float temp_normalized[3];
 
 bool sensors_sampling_isr_handler (gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx){
     BaseType_t xTaskawaken = pdFALSE;
@@ -186,6 +191,12 @@ void sensors_sampling_task (void *arg){
         // if (delta_time > 3000){
         //     ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
         // }
+    }
+}
+
+void color_calibration_task(void *arg){
+    while(1){
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -526,11 +537,13 @@ void debug_task(void *arg){
         // Print the whole rgbc as a 3x4 matrix
         // printf("\033[H\033[J");
         // printf("Angle Z: %.2f\n", angleZ);
-        // printf("vl53.distance: %u\t%u\t%u\t%u\t%u\n", vl53.distance[0], vl53.distance[1], vl53.distance[2], vl53.distance[3], vl53.distance[4]);
+        // printf("vl53.distance: %u\t%u\t%u\t%u\t%u\n", vl53[0].distance, vl53[1].distance, vl53[2].distance, vl53[3].distance, vl53[4].distance);
         // printf("Sensor 1: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[0], r[0], g[0], b[0]);
         // printf("Sensor 2: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[1], r[1], g[1], b[1]);
         // printf("Sensor 3: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[2], r[2], g[2], b[2]);
         // fflush(stdout);
+
+
         // for (int i = 0; i < 2; i++)
         // {
         // ESP_LOGI("M0", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[0].output, pid_motors[0].err, pid_motors[0].target_value, pid_motors[0].curr_value, encoder_pulses[0].delta_count, pid_motors[0].pTerm, pid_motors[0].iTerm, pid_motors[0].dTerm);
@@ -567,21 +580,23 @@ void debug_task(void *arg){
 void scratchpad_func(){
 
     while (1){
-        ESP_LOGI("Main", "Moving until wall");
-        vl53_front_center_move_until(100);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
-        ESP_LOGI("Main", "Performing wall calibration");
-        vl53_wall_calibration();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // ESP_LOGI("Main", "Moving until wall");
+        // vl53_front_center_move_until(100);
+        // vTaskDelay(pdMS_TO_TICKS(50));
 
-        ESP_LOGI("Main", "Turning");
-        mpu6050_turn(-90);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // ESP_LOGI("Main", "Performing wall calibration");
+        // vl53_wall_calibration();
+        // vTaskDelay(pdMS_TO_TICKS(50));
+
+        // ESP_LOGI("Main", "Turning");
+        // mpu6050_turn(-90);
+        // vTaskDelay(pdMS_TO_TICKS(50));
 
         // vl53_front_center_move_until(100);
         // mpu6050_turn(-90);
-            // ESP_LOGI(MAIN_LOG_TAG, "Distance_left:%u,Distancce_right:%u,Error:%f", vl53.distance[VL53_FRONT_LEFT], vl53.distance[VL53_FRONT_RIGHT], wall_calibration_pid_params.err);
+        // ESP_LOGI(MAIN_LOG_TAG, "Distance_left:%u,Distancce_right:%u,Error:%f", vl53.distance[VL53_FRONT_LEFT], vl53.distance[VL53_FRONT_RIGHT], wall_calibration_pid_params.err);
             
         }
         return;
@@ -972,10 +987,12 @@ void app_main(){
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
     
-    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 1, NULL, 1);
+    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 10, NULL, 1);
 
     xTaskCreatePinnedToCore(debug_task, "debug_task", 2048, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
+
+    xTaskCreatePinnedToCore(color_calibration_task, "uart_control_task", 2048, NULL, 5, &calibrate_color_sensor_task_handler, 1);
 
     // xTaskCreatePinnedToCore(maze_logic, "maze_logic", 2048, NULL, 10, NULL, 1);
 

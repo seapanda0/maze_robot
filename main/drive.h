@@ -148,4 +148,6 @@ void set_motor_speed();
 void initialize_pid_controller(pid_controller_t *pid_params, float target_value, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
 void mpu6050_turn_pid();
 void wall_calibration_pid();
+void color_calibration_task(void *arg);
+
 #endif
