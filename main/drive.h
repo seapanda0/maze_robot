@@ -48,6 +48,12 @@
 
 #define SERVO_ANGLE_TO_COMPARATOR(angle) (((angle* 3200) / 180  )+580) // 0 to 180 degrees
 
+#define PULSE_PER_ROTATION 1061.268
+#define PI 3.14159
+#define WHEEL_DIAMETER 4.8
+#define WHEEL_RADIUS 2.4
+#define KINEMATICS_SAMPLING_PERIOD 4 // 4MS
+
 
 // Encoder
 #define REDUCER_GEAR_RATIO 20.409
@@ -132,6 +138,9 @@ typedef struct {
     int prev_count;
     int curr_count;
     int delta_count;
+    int prev_count_kine;
+    int curr_count_kine;
+    int delta_count_kine;
 }encoder_pulses_t;
 
 
@@ -149,5 +158,6 @@ void initialize_pid_controller(pid_controller_t *pid_params, float target_value,
 void mpu6050_turn_pid();
 void wall_calibration_pid();
 void color_calibration_task(void *arg);
+void kinematics();
 
 #endif

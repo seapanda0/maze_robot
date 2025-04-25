@@ -62,6 +62,10 @@ float angleZ = 0;
 uint32_t r[3] = {0}, g[3] = {0}, b[3] = {0}, c[3] = {0};
 vl53_distancce_t vl53[5] = {0};
 int encoder_1_count = 0, encoder_2_count = 0;
+float global_x = 0; 
+float delta_x = 0;
+float v_left;
+float v_right;
 
 /*PID Structs*/
 pid_controller_t pid_motors[2] = {0};
@@ -114,6 +118,9 @@ void sensors_sampling_task (void *arg){
         
         // Every cycle, 4ms, sample mpu6050
         mpu6050_updateZ(&mpu6050_handle , &angleZ);
+
+        // Every 4ms calculate kinematics
+        kinematics();
 
         // Every 2 cycle , 8ms, sample wheel encoder and perform PID control
         if (cycle_count % 2 == 0)
@@ -192,6 +199,20 @@ void sensors_sampling_task (void *arg){
         //     ESP_LOGI(MAIN_LOG_TAG, "Time taken: %lld us", delta_time);
         // }
     }
+}
+
+void kinematics(){
+    // Every 4ms calculate speed once to for kinematic
+    for (int i = 0; i < 2; i++){
+        pcnt_unit_get_count(encoder1, &encoder_pulses[i].curr_count_kine);
+        encoder_pulses[i].delta_count = (encoder_pulses[i].curr_count_kine - encoder_pulses[i].prev_count_kine);
+        encoder_pulses[i].prev_count_kine = encoder_pulses[i].curr_count_kine;
+    }
+    // Current units are now in cm per second
+    v_left = (encoder_pulses[0].delta_count / (KINEMATICS_SAMPLING_PERIOD *  PULSE_PER_ROTATION)) * (2 * PI * WHEEL_RADIUS);
+    v_right = (encoder_pulses[1].delta_count / (KINEMATICS_SAMPLING_PERIOD *  PULSE_PER_ROTATION)) * (2 * PI * WHEEL_RADIUS);
+    
+    delta_x = (v_left / 2);
 }
 
 void color_calibration_task(void *arg){
@@ -564,6 +585,10 @@ void debug_task(void *arg){
         // printf("Wall_Calibration_Output:%f,Error:%f,TargetAngle:%f,P_Term:%f,I_Term:%f,D_Term:%f\r\n", 
         //     wall_calibration_pid_params.output, wall_calibration_pid_params.err, wall_calibration_pid_params.target_value,
         //     wall_calibration_pid_params.pTerm, wall_calibration_pid_params.iTerm, wall_calibration_pid_params.dTerm);
+
+
+        // print out v left and v right
+        ESP_LOGI("Velocity", "M0:%f M1:%f", v_left, v_right);
 
         // ESP_LOGI("M1", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[1].output, pid_motors[1].err, pid_motors[1].target_value, pid_motors[1].curr_value, encoder_pulses[1].delta_count, pid_motors[1].pTerm, pid_motors[1].iTerm, pid_motors[1].dTerm);
         // }
