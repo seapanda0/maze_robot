@@ -1,13 +1,25 @@
 #ifndef DRIVE_H
 #define DRIVE_H
 
+#include <stdint.h>
+
 // Button Input GPIO
 #define BUTTON_PIN GPIO_NUM_15
+
+// GPOI
+#define COLOR_SENSOR_LED GPIO_NUM_5
 
 // LED GPIO
 #define LED1 GPIO_NUM_14
 #define LED2 GPIO_NUM_13
 #define LED3 GPIO_NUM_27
+
+// VL53 Numbers
+#define VL53_FRONT_LEFT 3
+#define VL53_FRONT_RIGHT 2
+#define VL53_FRONT_CENTER 0
+#define VL53_LEFT 4
+#define VL53z_RIGHT 1
 
 /* PCNT and MCPWM Configurations */
 #define ENCODER2_PIN_A GPIO_NUM_36
@@ -36,8 +48,6 @@
 
 #define SERVO_ANGLE_TO_COMPARATOR(angle) (((angle* 3200) / 180  )+580) // 0 to 180 degrees
 
-// GPOI
-#define COLOR_SENSOR_LED GPIO_NUM_5
 
 // Encoder
 #define REDUCER_GEAR_RATIO 20.409
@@ -54,7 +64,15 @@ typedef enum {
     TURN,
     STRAIGHT,
     DO_NOT_MOVE,
-} mpu6050_move_t;
+    MANUAL,
+    WALL_CALIBRATION,
+} robot_move_t;
+
+typedef enum {
+    EMPTY,
+    WALL,
+    NOT_VALID,
+} vl53_detection_t;
 
 // MPU6050 movement control PID parametes
 // THese parametes are tuned for 8ms interval
@@ -67,8 +85,8 @@ typedef enum {
 #define PID_STRAIGHT_TOLERANCE 1
 
 // MPU6050 Turning PID Parameters
-#define PID_TURN_KP 0.055
-#define PID_TURN_KI 0.00001
+#define PID_TURN_KP 0.045
+#define PID_TURN_KI 0.000005
 #define PID_TURN_KD 0
 #define PID_TURN_MAX_INTEGRAL 0.5
 #define PID_TURN_MIN_INTEGRAL -0.5
@@ -85,7 +103,12 @@ typedef enum {
 #define MOTOR_SPEED_MIN_INTEGRAL -1800
 #define MOTOR_SPEED_PID_PERIOD 8 // 8ms
 
-
+#define WALL_CALIBRATION_KP 0.02
+#define WALL_CALIBRATION_KI 0.00002
+#define WALL_CALIBRATION_KD 0
+#define WALL_CALIBRATION_MAX_INTEGRAL 0.5
+#define WALL_CALIBRATION_MIN_INTEGRAL -0.5
+#define WALL_CALIBRATION_TOLERANCE 3
 
 typedef struct {
     float target_value;
@@ -111,6 +134,12 @@ typedef struct {
     int delta_count;
 }encoder_pulses_t;
 
+
+typedef struct {
+    uint16_t distance;
+    vl53_detection_t detection;
+}vl53_distancce_t;
+
 void pcnt_init();
 void mcpwm_init();
 void motor_pid_speed_control();
@@ -118,4 +147,5 @@ void mpu6050_move_straight_pid();
 void set_motor_speed();
 void initialize_pid_controller(pid_controller_t *pid_params, float target_value, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
 void mpu6050_turn_pid();
+void wall_calibration_pid();
 #endif

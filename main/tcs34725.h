@@ -56,5 +56,6 @@ esp_err_t tcs34725_read_raw_multi (
 #define TCS34725_ENABLE_AEN 0x02
 
 #define TCS34725_INTEGRATIONTIME (0xF6) /**< 24.0ms - 10 cycles - Max Count: 10240 */
+#define TCS34725_INTEGRATIONTIME_240MS (0x9C) /**< 240.0ms - 100 cycles - Max Count: 65535 */
 #define TCS34725_AGAIN (0x00) // 1x gain
 #endif

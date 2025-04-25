@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "driver/pulse_cnt.h"
+#include "driver/uart.h"
 #include "driver/mcpwm_prelude.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -44,7 +45,8 @@ TaskHandle_t wall_detection_task_handler = NULL;
 taskCommand_t motor_speed_task_command = STOP; 
 taskCommand_t mpu6050_move_straight_command = STOP; 
 taskCommand_t mpu6050_turn_command = STOP; 
-mpu6050_move_t mpu6050_move_type = STRAIGHT;
+taskCommand_t wall_calibration_turn_command = STOP; 
+robot_move_t robot_move_type = DO_NOT_MOVE;
 
 /* Variables measuring timing */
 int64_t prev_time = 0;
@@ -57,7 +59,7 @@ uint32_t cycle_count = 0;
 /*Sensor Readings*/
 float angleZ = 0;
 uint32_t r[3] = {0}, g[3] = {0}, b[3] = {0}, c[3] = {0};
-uint16_t distances[5] = {0};
+vl53_distancce_t vl53[5] = {0};
 int encoder_1_count = 0, encoder_2_count = 0;
 
 /*PID Structs*/
@@ -65,7 +67,9 @@ pid_controller_t pid_motors[2] = {0};
 pid_controller_t mpu6050_pid_params = {0};
 encoder_pulses_t encoder_pulses[2] = {0};
 pid_controller_t mpu6050_turn_pid_params = {0};
+pid_controller_t wall_calibration_pid_params = {0};
 bool mpu6050_turn_in_position = false;
+bool wall_calibration_in_position = false;
 
 /*Motor controls*/
 float basespeed_m0 = 1.25;
@@ -77,6 +81,7 @@ uart_control_input_t uart_task_args = {
     .pid_motors_m1 = &pid_motors[0],
     .pid_motors_m2 = &pid_motors[1],
     .motor_speed_task_command = &motor_speed_task_command,
+    .robot_move_type = &robot_move_type,
     .motor1_comparator = &motor1,
     .motor2_comparator = &motor2,
 };
@@ -108,7 +113,7 @@ void sensors_sampling_task (void *arg){
         // Every 2 cycle , 8ms, sample wheel encoder and perform PID control
         if (cycle_count % 2 == 0)
         {
-            switch (mpu6050_move_type)
+            switch (robot_move_type)
             {
             case STRAIGHT:{
                 mpu6050_move_straight_pid();
@@ -134,28 +139,46 @@ void sensors_sampling_task (void *arg){
                 pid_motors[0].target_value = 0;
                 pid_motors[1].target_value = 0;
                 break;
+            }case MANUAL:{
+                break;
+            }case WALL_CALIBRATION:{
+                wall_calibration_pid();
+                pid_motors[0].target_value = wall_calibration_pid_params.output;
+                pid_motors[1].target_value = -wall_calibration_pid_params.output;
+
+
             }
-            }
+        }
             pcnt_unit_get_count(encoder1, &encoder_pulses[0].curr_count);
             pcnt_unit_get_count(encoder2, &encoder_pulses[1].curr_count);
             motor_pid_speed_control();
         }
-
-        // Every 6th cycle, 24ms, sample tcs34725
-        if (cycle_count % 6 == 0){
-            tcs34725_read_raw_multi(&tcs34725_handle, &tca95_handle, c, r, g, b);  // Implement error handling!!!
-        }
+        
         // Every 9th cycle, 36ms, sample vl53l0x
         if (cycle_count % 9 == 0){
             for (int i = 0; i < 5; i++){
                 status |= i2c_master_transmit_receive(*vl53l0x_arr[i], &write_buf, 1, read_buf, 2, I2C_TIMEOUT_MS);
                 status |= i2c_master_transmit(*vl53l0x_arr[i], write_buf_clear, 2 , I2C_TIMEOUT_MS);
                 if (status == ESP_OK) {        
-                    distances[i] = read_buf[1] | (read_buf[0] << 8);
+                    vl53[i].distance = read_buf[1] | (read_buf[0] << 8);
                 } // Implement error handling!!!
+                
+                // we wont see vl53 over 800 in our application anyway
+                if (vl53[i].distance > 800){
+                    vl53[i].detection = NOT_VALID;
+                }else if (vl53[i].distance > 120){
+                    vl53[i].detection = EMPTY;
+                }else{
+                    vl53[i].detection = WALL;
+                }
             }
             xTaskNotifyGive(wall_detection_task_handler);
             
+        }
+        
+        // Every 60th cycle, 240ms, sample tcs34725
+        if (cycle_count % 60 == 0){
+            tcs34725_read_raw_multi(&tcs34725_handle, &tca95_handle, c, r, g, b);  // Implement error handling!!!
         }
         // prev_time = curr_time;
         // curr_time = esp_timer_get_time();
@@ -172,11 +195,11 @@ void wall_detection_task(void *arg){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         // Perform wall detection logic here
         // For example, check the distance from the sensors and take action
-        for (int i = 0; i < 5; i++){
-            if (distances[i] < 1000){ // Example threshold
-                ESP_LOGI(MAIN_LOG_TAG, "Wall detected by sensor %d", i);
-            }
-        }
+        // for (int i = 0; i < 5; i++){
+        //     if (vl53.distance[i] < 1000){ // Example threshold
+        //         ESP_LOGI(MAIN_LOG_TAG, "Wall detected by sensor %d", i);
+        //     }
+        // }
     }
 }
 
@@ -358,6 +381,7 @@ void mpu6050_turn_pid()
             break;
         }case STOP:{
             //clear pid parameters
+            mpu6050_turn_in_position = false;
             in_position_cycle_count = 0;
             mpu6050_turn_pid_params.output = 0;
             mpu6050_turn_pid_params.integral = 0;
@@ -376,14 +400,86 @@ void mpu6050_turn_pid()
     
 }
 
+void wall_calibration_pid(){
+    static int in_position_cycle_count = 0;
+    switch (wall_calibration_turn_command)
+    {
+    case RUN:
+    {
+        if (vl53[VL53_FRONT_LEFT].detection == NOT_VALID || vl53[VL53_FRONT_RIGHT].detection == NOT_VALID){
+            wall_calibration_pid_params.output = 0;
+            ESP_LOGE("VL53", "Sensor out of range");
+        }
+        else{
+            wall_calibration_pid_params.err = vl53[VL53_FRONT_LEFT].distance - vl53[VL53_FRONT_RIGHT].distance;
+
+            // Calculate P term
+            wall_calibration_pid_params.pTerm = wall_calibration_pid_params.kp * wall_calibration_pid_params.err;
+
+            // Calculate I term
+            wall_calibration_pid_params.integral += wall_calibration_pid_params.err;
+            wall_calibration_pid_params.iTerm = wall_calibration_pid_params.ki * wall_calibration_pid_params.integral;
+            if (wall_calibration_pid_params.iTerm > wall_calibration_pid_params.integral_limit_max)
+            {
+                wall_calibration_pid_params.iTerm = wall_calibration_pid_params.integral_limit_max;
+            }
+            else if (wall_calibration_pid_params.iTerm < wall_calibration_pid_params.integral_limit_min)
+            {
+                wall_calibration_pid_params.iTerm = wall_calibration_pid_params.integral_limit_min;
+            }
+
+            // Derivative not implemented
+
+            // Calculate output and if it is within tolerance, set output to 0
+            if (fabs(wall_calibration_pid_params.err) < WALL_CALIBRATION_TOLERANCE)
+            {
+                in_position_cycle_count++;
+                wall_calibration_pid_params.output = 0;
+            }
+            else
+            {
+                wall_calibration_pid_params.output = wall_calibration_pid_params.pTerm + wall_calibration_pid_params.iTerm;
+            }
+            // If robot is already facing wall straight, exit the wall calibration routine
+            if (in_position_cycle_count > 100){
+                wall_calibration_pid_params.output = 0;
+                wall_calibration_in_position = true;
+                wall_calibration_turn_command = STOP;
+            }
+        }
+        break;
+    }
+    case STOP:
+    {
+        wall_calibration_in_position = false;
+        // clear pid parameters
+        in_position_cycle_count = 0;
+        wall_calibration_pid_params.output = 0;
+        wall_calibration_pid_params.integral = 0;
+        wall_calibration_pid_params.prev_err = 0;
+        wall_calibration_pid_params.curr_value = 0;
+        break;
+    }
+    case RESTART:
+    {
+        // Angle Z need to be manually set before setting the command to restart
+        wall_calibration_turn_command = RUN;
+        in_position_cycle_count = 0;
+        wall_calibration_in_position = false;
+        break;
+    }
+    }
+}
+
 void mpu6050_turn(int angle){
     mpu6050_turn_pid_params.target_value = angle + angleZ;
-    mpu6050_turn_command = RESTART;
-    mpu6050_move_type = TURN;
     motor_speed_task_command = RUN;
+    robot_move_type = TURN;
+    mpu6050_turn_command = RESTART;
     while (1){
         if (mpu6050_turn_in_position == true){
-            mpu6050_move_type = DO_NOT_MOVE;
+            mpu6050_turn_in_position = false;
+            robot_move_type = DO_NOT_MOVE;
             pid_motors[0].target_value = 0;
             pid_motors[1].target_value = 0;
             break;
@@ -394,14 +490,14 @@ void mpu6050_turn(int angle){
 
 void vl53_front_center_move_until(int distance){
     motor_speed_task_command = RUN;
+    robot_move_type = STRAIGHT;
     mpu6050_move_straight_command = RESTART;
-    mpu6050_move_type = STRAIGHT;
     while (1){
         // Arbitrary added a 20mm!!! Test again!!!
-        if (distances[0] < distance + 20){
-            ESP_LOGI(MAIN_LOG_TAG, "Distance: %u", distances[0]);
+        if (vl53[0].distance < distance + 20){
+            // ESP_LOGI(MAIN_LOG_TAG, "Distance: %u", vl53.distance[0]);
             mpu6050_move_straight_command = STOP;
-            mpu6050_move_type = DO_NOT_MOVE;
+            robot_move_type = DO_NOT_MOVE;
             pid_motors[0].target_value = 0;
             pid_motors[1].target_value = 0;
             break;
@@ -410,12 +506,27 @@ void vl53_front_center_move_until(int distance){
     }
 }
 
+void vl53_wall_calibration(){
+    robot_move_type = WALL_CALIBRATION;
+    wall_calibration_turn_command = RESTART;
+    motor_speed_task_command = RUN;
+    while(1){
+        if (wall_calibration_in_position == true){
+            wall_calibration_in_position = false;
+            robot_move_type = DO_NOT_MOVE;
+            pid_motors[0].target_value = 0;
+            pid_motors[1].target_value = 0;
+            break;
+        }    
+    }
+}
+
 void debug_task(void *arg){
     while(1){
         // Print the whole rgbc as a 3x4 matrix
         // printf("\033[H\033[J");
         // printf("Angle Z: %.2f\n", angleZ);
-        // printf("Distances: %u\t%u\t%u\t%u\t%u\n", distances[0], distances[1], distances[2], distances[3], distances[4]);
+        // printf("vl53.distance: %u\t%u\t%u\t%u\t%u\n", vl53.distance[0], vl53.distance[1], vl53.distance[2], vl53.distance[3], vl53.distance[4]);
         // printf("Sensor 1: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[0], r[0], g[0], b[0]);
         // printf("Sensor 2: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[1], r[1], g[1], b[1]);
         // printf("Sensor 3: C: %lu\tR: %lu\tG: %lu\tB: %lu\n", c[2], r[2], g[2], b[2]);
@@ -436,6 +547,10 @@ void debug_task(void *arg){
         //         mpu6050_pid_params.output, mpu6050_pid_params.err, mpu6050_pid_params.target_value, angleZ, 
         //         mpu6050_pid_params.pTerm, mpu6050_pid_params.iTerm, mpu6050_pid_params.dTerm);
         
+        // print the debug statement for wall calibratiuon
+        // printf("Wall_Calibration_Output:%f,Error:%f,TargetAngle:%f,P_Term:%f,I_Term:%f,D_Term:%f\r\n", 
+        //     wall_calibration_pid_params.output, wall_calibration_pid_params.err, wall_calibration_pid_params.target_value,
+        //     wall_calibration_pid_params.pTerm, wall_calibration_pid_params.iTerm, wall_calibration_pid_params.dTerm);
 
         // ESP_LOGI("M1", "Output: %f, Error: %f, Target Speed: %f, Current Speed: %f, Delta Count: %d, P Term: %f, I Term: %f, D Term: %f", pid_motors[1].output, pid_motors[1].err, pid_motors[1].target_value, pid_motors[1].curr_value, encoder_pulses[1].delta_count, pid_motors[1].pTerm, pid_motors[1].iTerm, pid_motors[1].dTerm);
         // }
@@ -450,12 +565,24 @@ void debug_task(void *arg){
 }
 
 void scratchpad_func(){
-    vl53_front_center_move_until(100);
-    mpu6050_turn(-90);
+
     while (1){
-            ESP_LOGI(MAIN_LOG_TAG, "Distance: %u", distances[0]);
+        ESP_LOGI("Main", "Moving until wall");
+        vl53_front_center_move_until(100);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        ESP_LOGI("Main", "Performing wall calibration");
+        vl53_wall_calibration();
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        ESP_LOGI("Main", "Turning");
+        mpu6050_turn(-90);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // vl53_front_center_move_until(100);
+        // mpu6050_turn(-90);
+            // ESP_LOGI(MAIN_LOG_TAG, "Distance_left:%u,Distancce_right:%u,Error:%f", vl53.distance[VL53_FRONT_LEFT], vl53.distance[VL53_FRONT_RIGHT], wall_calibration_pid_params.err);
             
-            vTaskDelay(pdMS_TO_TICKS(1000)); 
         }
         return;
 }
@@ -690,6 +817,7 @@ void app_main(){
     initialize_pid_controller(&pid_motors[1], 0, MOTOR_SPEED_KP, MOTOR_SPEED_KI, MOTOR_SPEED_KD, MOTOR_SPEED_MAX_INTEGRAL, MOTOR_SPEED_MIN_INTEGRAL);
     initialize_pid_controller(&mpu6050_pid_params, 0, PID_STRAIGHT_KP, PID_STRAIGHT_KI, PID_STRAIGHT_KD, PID_STRAIGHT_MAX_INTEGRAL, PID_STRAIGHT_MIN_INTEGRAL);
     initialize_pid_controller(&mpu6050_turn_pid_params, 0, PID_TURN_KP, PID_TURN_KI, PID_TURN_KD, PID_TURN_MAX_INTEGRAL, PID_TURN_MIN_INTEGRAL);
+    initialize_pid_controller(&wall_calibration_pid_params, 0, WALL_CALIBRATION_KP, WALL_CALIBRATION_KI, WALL_CALIBRATION_KD, WALL_CALIBRATION_MAX_INTEGRAL, WALL_CALIBRATION_MIN_INTEGRAL);
 
     /* GPIO Configuration and Initial State */
     gpio_config_t xshut_config = {
@@ -704,6 +832,8 @@ void app_main(){
     gpio_set_level(X_SHUT_2, 0);
     gpio_set_level(X_SHUT_3, 0);
     gpio_set_level(X_SHUT_4, 0);
+
+    gpio_set_level(COLOR_SENSOR_LED, 1);
 
     mcpwm_init();
     
@@ -824,26 +954,29 @@ void app_main(){
 
     /* Initialize ESP32 Hardware TImer End */
     
+    xTaskCreatePinnedToCore(wall_detection_task, "wall_detection_task", 2048, NULL, 1, &wall_detection_task_handler, 1);
     xTaskCreatePinnedToCore(sensors_sampling_task, "sensor_sampling_task", 2048, NULL, 10, &sensor_sampling_handler, 0);
     gptimer_enable(sensor_sampling_timer);
     gptimer_start(sensor_sampling_timer);
 
-
-    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 1, NULL, 1);
-
-    
     gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
-    ESP_LOGI(MAIN_LOG_TAG, "Waiting for button press to start..."); 
-    // wait until button is pressed
+    ESP_LOGI(MAIN_LOG_TAG, "Waiting for button press or uart character to start..."); 
+    // wait until button is pressed or uart character is received
+    uint8_t temp;
     while (gpio_get_level(BUTTON_PIN) == 1){
-        vTaskDelay(pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(UART_NUM_2, &temp, 1, pdMS_TO_TICKS(50));
+        if (len > 0){
+            ESP_LOGI(MAIN_LOG_TAG, "UART character received: %c", temp);
+            break;
+        }
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
+    
+    xTaskCreatePinnedToCore(uart_control_task, "uart_control_task", 2048, (void*)&uart_task_args, 1, NULL, 1);
 
     xTaskCreatePinnedToCore(debug_task, "debug_task", 2048, NULL, 1, NULL, 1);
-    // xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(scratchpad_func, "scratchpadfunc", 2048, NULL, 1, NULL, 1);
 
-    // xTaskCreatePinnedToCore(wall_detection_task, "wall_detection_task", 2048, NULL, 1, &, &wall_detection_task_handler, 1);
     // xTaskCreatePinnedToCore(maze_logic, "maze_logic", 2048, NULL, 10, NULL, 1);
 
 

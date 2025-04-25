@@ -27,32 +27,40 @@ void uart_control_task(void *arg)
             {
             case 'w':{
                 *(uart_control_input->motor_speed_task_command) = RUN;
+                *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = 2.5;
                 uart_control_input->pid_motors_m2->target_value = 2.5;
                 break;
             }
             case 's':{
                 *(uart_control_input->motor_speed_task_command) = RUN;
+                *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = -2.5;
                 uart_control_input->pid_motors_m2->target_value = -2.5;
                 break;
             }case 'a':{
                 *(uart_control_input->motor_speed_task_command) = RUN;
+                *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = -2.5;
                 uart_control_input->pid_motors_m2->target_value = 2.5;
                 break;
             }case 'd':{
                 *(uart_control_input->motor_speed_task_command) = RUN;
+                *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = 2.5;
                 uart_control_input->pid_motors_m2->target_value = -2.5;
                 break;
             }case ' ':{
                 // *(uart_control_input->motor_speed_task_command) = STOP;
+                *(uart_control_input->robot_move_type) = MANUAL;
                 uart_control_input->pid_motors_m1->target_value = 0;
                 uart_control_input->pid_motors_m2->target_value = 0;
                 break;}
-
-        }
+            case 'k':{
+                esp_restart();
+                break;
+            }
+            }
         }else{
             gpio_set_level(LED3, 0);
         }

@@ -26,7 +26,7 @@ esp_err_t tcs34725_init(i2c_master_dev_handle_t *tcs34725_handle){
   }
 
   // Set the integration time
-  uint8_t buf8_arr[2] = {TCS34725_COMMAND | TCS34725_ATIME, TCS34725_INTEGRATIONTIME};
+  uint8_t buf8_arr[2] = {TCS34725_COMMAND | TCS34725_ATIME, TCS34725_INTEGRATIONTIME_240MS};
   status |= i2c_master_transmit(*tcs34725_handle, buf8_arr, 2, I2C_TIMEOUT_MS);
 
   // Set gain

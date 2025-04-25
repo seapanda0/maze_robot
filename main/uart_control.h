@@ -9,6 +9,7 @@ typedef struct{
     pid_controller_t *pid_motors_m1;
     pid_controller_t *pid_motors_m2;
     taskCommand_t *motor_speed_task_command;
+    robot_move_t *robot_move_type;
     mcpwm_cmpr_handle_t *motor1_comparator;
     mcpwm_cmpr_handle_t *motor2_comparator;
 
