@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_random.h"
 
 #include <math.h>
 #include <stdlib.h> // For abs()
@@ -115,6 +116,8 @@ bool reset_kinematiccs = false;
 bool fire_wall_event = false;
 bool fire_side_wall_event = false;
 
+robot_state_t robot_state = ROBOT_MAKE_DECISION;
+
 void servo_blink_extrude(void *args);
 
 bool sensors_sampling_isr_handler (gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx){
@@ -204,10 +207,7 @@ void sensors_sampling_task (void *arg){
                 } // Implement error handling!!!
             }
             // we wont see vl53 over 800 in our application anyway
-            if (vl53[VL53_FRONT_CENTER].distance > 800){
-                vl53[VL53_FRONT_CENTER].detection = NOT_VALID;
-            }
-            else if (vl53[VL53_FRONT_CENTER].distance > 120)
+            if (vl53[VL53_FRONT_CENTER].distance > 100)
             {
                 vl53[VL53_FRONT_CENTER].detection = EMPTY;
             }
@@ -215,37 +215,20 @@ void sensors_sampling_task (void *arg){
                 vl53[VL53_FRONT_CENTER].detection = WALL;
             }
 
-            if (vl53[VL53_LEFT].distance > 800){ 
-                vl53[VL53_LEFT].detection = NOT_VALID;
-            }
-            else if (vl53[VL53_LEFT].distance > 200)
+            if (vl53[VL53_LEFT].distance > 200)
             {
                 vl53[VL53_LEFT].detection = EMPTY;
-                if (fire_side_wall_event){
-                    xTaskNotifyGiveIndexed(maze_logic_task_handler, SIDE_WALL_SLOT);
-                }
-
             }
             else{
                 vl53[VL53_LEFT].detection = WALL;
             }
 
-            if (vl53[VL53z_RIGHT].distance > 800){
-                vl53[VL53z_RIGHT].detection = NOT_VALID;
-            }
-            else if (vl53[VL53z_RIGHT].distance > 200)
+            if (vl53[VL53z_RIGHT].distance > 200)
             {
                 vl53[VL53z_RIGHT].detection = EMPTY;
-                if (fire_side_wall_event){
-                    xTaskNotifyGiveIndexed(maze_logic_task_handler, SIDE_WALL_SLOT);
-                }
             }
             else{
                 vl53[VL53z_RIGHT].detection = WALL;
-            }
-
-            if (fire_wall_event){
-                xTaskNotifyGive(maze_logic_task_handler);
             }
             // xTaskNotifyGive(wall_detection_task_handler);
             
@@ -895,6 +878,8 @@ void stop_robot_H(){
     pid_motors[1].target_value = 0;
 }
 
+
+// restructure needed
 void robot_wall_calibration_H(){
     robot_move_type = WALL_CALIBRATION;
     wall_calibration_turn_command = RESTART;
@@ -958,55 +943,32 @@ void servo_blink_extrude(void *args){
 }
 
 void maze_logic(){
-    while (1){
-        // Check for sensor updates
-        // Move till front wall detected
-        while(1){
-            ESP_LOGI(MAIN_LOG_TAG, "Moving Straight Until Interrupted");
-            move_straight_gyro_H();
-            fire_wall_event = true;
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-            fire_wall_event = false;
-            // If front wall, stop robot, calibrate against wall
-            if (vl53[VL53_FRONT_CENTER].detection == WALL){
-                ESP_LOGI(MAIN_LOG_TAG, "Wall Detected! Performing Wall calibration");
-                stop_robot_H();
-                // Perform wall calibration
-                robot_wall_calibration_H();
-                ESP_LOGI(MAIN_LOG_TAG, "Wall calibration done");
-                
-                if (vl53[VL53_LEFT].detection != WALL){
-                    ESP_LOGI(MAIN_LOG_TAG, "There is no left wall Detected");
-                    mpu6050_turn_left();
-                    
-                }else if (vl53[VL53z_RIGHT].detection != WALL){
-                    ESP_LOGI(MAIN_LOG_TAG, "THeres no right wall Detected");
-                    mpu6050_turn_right();
+    switch (robot_state){
+        case ROBOT_MAKE_DECISION:{
+            if (vl53[VL53_FRONT_CENTER].detection == WALL && vl53[VL53_LEFT].detection == WALL &&  vl53[VL53z_RIGHT].detection == WALL){
+                robot_state = ROBOT_MOVE_REVERSE_UNTIL_EMPTY;
+            }else if (vl53[VL53_FRONT_CENTER].detection == WALL && vl53[VL53_LEFT].detection == EMPTY &&  vl53[VL53z_RIGHT].detection == WALL){
+                robot_state = ROBOT_TURN_LEFT;
+            }else if (vl53[VL53_FRONT_CENTER].detection == WALL && vl53[VL53_LEFT].detection == WALL &&  vl53[VL53z_RIGHT].detection == EMPTY){
+                robot_state = ROBOT_TURN_RIGHT;
+
+            }else if (vl53[VL53_FRONT_CENTER].detection == WALL && vl53[VL53_LEFT].detection == EMPTY &&  vl53[VL53z_RIGHT].detection == EMPTY){
+                if ((esp_random() % 2) == 0){
+                    robot_state = ROBOT_TURN_LEFT;
                 }else{
-                    ESP_LOGI(MAIN_LOG_TAG, "Reversing until side wall is found!");
-                    move_reverse_gyro_H();
-                    fire_side_wall_event = true;
-                    ulTaskNotifyTakeIndexed(SIDE_WALL_SLOT, pdTRUE, portMAX_DELAY);
-                    fire_side_wall_event = false;
-                    stop_robot_H();
-                    if (vl53[VL53_LEFT].detection != WALL)
-                    {
-                        ESP_LOGI(MAIN_LOG_TAG, "Left Wall not Detected");
-                        mpu6050_turn_left();
-                    }
-                    else if (vl53[VL53z_RIGHT].detection != WALL)
-                    {
-                        ESP_LOGI(MAIN_LOG_TAG, "Right Wall not Detected");
-                        mpu6050_turn_right();
-                    }
+                    robot_state = ROBOT_TURN_LEFT;
 
-                    // Move backwards towards cloest one
                 }
+            }else if (vl53[VL53_FRONT_CENTER].detection == EMPTY){
+                robot_state = ROBOT_MOVE_STRAIGHT;
             }
+            break;
+        case ROBOT_TURN_LEFT :{
+            
         }
-
-        vTaskDelay(portMAX_DELAY);
-
+        }default:{
+            break;
+        }
     }
 }
 

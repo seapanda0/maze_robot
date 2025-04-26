@@ -90,6 +90,17 @@ typedef enum {
     TREASURE_EVENT,
 } maze_event_t;
 
+typedef enum{
+    ROBOT_TURNING,
+    ROBOT_MOVE_STRAIGHT,
+    ROBOT_MOVE_REVERSE_UNTIL_EMPTY,
+    ROBOT_MAKE_DECISION,
+    ROBOT_TURN_LEFT,
+    ROBOT_TURN_RIGHT,
+    ROBOT_MOVE_X_VALUE,
+    ROBOT_WAIT,
+    ROBOT_TASK_TIMEOUT,
+}robot_state_t;
 
 // MPU6050 movement control PID parametes
 // THese parametes are tuned for 8ms interval
